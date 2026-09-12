@@ -13,11 +13,12 @@ interne.
 - `.env.example` — liste des variables d'environnement attendues (à copier
   en `.env` pour un lancement en local — **ne jamais commit `.env`**)
 - `render.yaml` — Blueprint Render (déploiement automatique du bot en
-  *Background Worker*, avec disque persistant pour la base SQLite)
+  Web Service, plan gratuit)
 
-La base `bot_isib.db` (SQLite) et le fichier `.env` sont volontairement
-exclus du dépôt via `.gitignore` : ce sont des données sensibles /
-générées, jamais du code.
+Le bot stocke ses données (étudiant·e·s authentifié·e·s, demandes
+académiques) dans une base **PostgreSQL externe (Neon, gratuit)** plutôt
+que dans un fichier SQLite local — voir la section suivante. Le fichier
+`.env` est volontairement exclu du dépôt via `.gitignore`.
 
 ## Lancer le bot en local
 
@@ -25,9 +26,31 @@ générées, jamais du code.
 python -m venv .venv
 source .venv/bin/activate      # Windows : .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env           # puis remplis les valeurs
+cp .env.example .env           # puis remplis les valeurs (dont DATABASE_URL)
 python bot.py
 ```
+
+## Base de données persistante (Neon PostgreSQL, gratuit)
+
+Le plan gratuit de Render n'a pas de disque persistant : sans base
+externe, toute donnée écrite localement (un fichier SQLite par exemple)
+serait perdue au moindre redémarrage du service. Ce dépôt utilise donc
+**Neon**, un PostgreSQL managé gratuit à vie, dont le calcul se
+"réveille" automatiquement et instantanément à la première requête —
+aucune intervention manuelle après une période d'inactivité.
+
+1. Crée un compte gratuit sur [neon.tech](https://neon.tech) (connexion
+   possible avec GitHub).
+2. Crée un nouveau projet (ex. nommé `bot-isib`).
+3. Sur la page du projet, va dans **Connection Details** / **Connection
+   string** et copie l'URL au format
+   `postgresql://user:password@host/dbname?sslmode=require`.
+4. **N'envoie jamais cette URL dans un chat** (elle contient un mot de
+   passe) : colle-la uniquement dans le champ `DATABASE_URL` de Render
+   (étape suivante) ou dans ton `.env` local.
+5. Les tables (`verified_students`, `academic_requests`) sont créées
+   automatiquement par le bot à son premier démarrage — rien à faire
+   côté Neon.
 
 ## Déploiement 24h/24 - 7j/7 sur Render, **gratuitement**
 
@@ -71,6 +94,7 @@ du bot toutes les 10 minutes, 24h/24.
    | `EMAIL_SENDER_NAME` | Nom affiché de l'expéditeur |
    | `AUDIT_CHANNEL_ID` | ID du salon d'audit |
    | `VALIDATION_CHANNEL_ID` | ID du salon de validation interne |
+   | `DATABASE_URL` | Chaîne de connexion Neon (voir section précédente) |
 
 5. Clique **Apply**. Render installe les dépendances puis lance
    `python bot.py`. Une fois déployé, note l'URL publique du service
@@ -96,29 +120,15 @@ Utilise un service de cron gratuit, par exemple
 Une fois branché, **chaque `git push` sur `main`** déclenche
 automatiquement un nouveau déploiement (`autoDeploy: true`).
 
-### ⚠️ Limite du plan gratuit : pas de stockage persistant
+### Les données survivent-elles aux redémarrages ?
 
-Le plan **Free** de Render ne permet pas d'attacher de disque
-persistant. Résultat : à chaque redémarrage du service (redéploiement,
-ou un redémarrage imposé par Render), le fichier `bot_isib.db` repart
-de zéro — **les étudiant·e·s déjà authentifié·e·s et l'historique des
-demandes académiques sont perdus**. Le ping externe limite les
-redémarrages liés à l'inactivité, mais ne les supprime pas totalement
-(maintenance Render, déploiements, etc.).
-
-Si la conservation durable de ces données est importante (ce qui est
-probablement le cas ici), les options sont :
-
-1. **Passer le service en Background Worker + disque persistant**
-   (~7 $/mois) — solution la plus simple et la plus fiable, voir
-   git history de ce fichier pour la configuration correspondante.
-2. **Utiliser une base de données externe gratuite** (ex. Postgres
-   gratuit chez [Supabase](https://supabase.com) ou
-   [Neon](https://neon.tech), ou SQLite distant via
-   [Turso](https://turso.tech)) à la place du fichier SQLite local —
-   demande une petite adaptation du code de `bot.py`.
-
-Dis-moi si tu veux que je mette en place l'une de ces deux options.
+Oui. Le service Render lui-même reste sans disque persistant (plan
+Free oblige), mais ça n'a plus d'importance : toutes les données du bot
+(étudiant·e·s authentifié·e·s, demandes académiques) vivent dans la
+base Neon externe, pas sur le disque de Render. Que le service Render
+redémarre pour cause d'inactivité, de redéploiement, ou de maintenance,
+la base Neon n'est pas affectée et le bot la retrouve intacte à chaque
+démarrage.
 
 ### Sans Blueprint (méthode manuelle, alternative)
 
@@ -129,7 +139,8 @@ Si tu préfères ne pas utiliser `render.yaml` :
 2. **Build command** : `pip install -r requirements.txt`
 3. **Start command** : `python bot.py`
 4. Plan : **Free**.
-5. Renseigne les mêmes variables d'environnement que ci-dessus.
+5. Renseigne les mêmes variables d'environnement que ci-dessus, dont
+   `DATABASE_URL` (connexion Neon).
 6. Configure le ping externe comme à l'étape 3 ci-dessus.
 
 ## ⚠️ Sécurité — token et clé API

@@ -13,7 +13,7 @@
 #    1.4 Permissions internes du bot
 #    1.5 Intents Discord
 #
-# 2. BASE DE DONNÉES SQLITE
+# 2. BASE DE DONNÉES (POSTGRESQL - NEON)
 #    2.1 Connexion
 #    2.2 Initialisation
 #    2.3 Étudiants authentifiés
@@ -75,10 +75,12 @@ import time
 import secrets
 import asyncio
 import html
-import sqlite3
 import json
 
 from datetime import datetime, timezone
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 import discord
 from discord import app_commands
@@ -112,6 +114,8 @@ EMAIL_SENDER_NAME = os.getenv("EMAIL_SENDER_NAME")
 AUDIT_CHANNEL_ID = os.getenv("AUDIT_CHANNEL_ID")
 VALIDATION_CHANNEL_ID = os.getenv("VALIDATION_CHANNEL_ID")
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 
 VARIABLES_OBLIGATOIRES = {
     "DISCORD_TOKEN": TOKEN,
@@ -121,6 +125,7 @@ VARIABLES_OBLIGATOIRES = {
     "EMAIL_SENDER_NAME": EMAIL_SENDER_NAME,
     "AUDIT_CHANNEL_ID": AUDIT_CHANNEL_ID,
     "VALIDATION_CHANNEL_ID": VALIDATION_CHANNEL_ID,
+    "DATABASE_URL": DATABASE_URL,
 }
 
 
@@ -165,8 +170,6 @@ TITRE_PANNEAU_INSCRIPTION = (
     "🎓 INSCRIPTIONS ACADÉMIQUES"
 )
 
-DB_PATH = os.getenv("DB_PATH", "bot_isib.db")
-
 
 # ============================================================
 # 1.4 PERMISSIONS INTERNES DU BOT
@@ -194,7 +197,17 @@ intents.members = True
 
 
 # ============================================================
-# 2. BASE DE DONNÉES SQLITE
+# 2. BASE DE DONNÉES (POSTGRESQL - NEON)
+# ============================================================
+#
+# Base externe persistante (gratuite chez Neon) : les données
+# survivent aux redémarrages du service Render, contrairement
+# à un fichier SQLite local sur le plan Free (pas de disque
+# persistant).
+#
+# RealDictCursor fait en sorte que chaque ligne se comporte
+# comme un dict (row["colonne"]), exactement comme le faisait
+# sqlite3.Row auparavant : le reste du code n'a pas à changer.
 # ============================================================
 
 
@@ -204,13 +217,10 @@ intents.members = True
 
 def connexion_db():
 
-    connexion = sqlite3.connect(
-        DB_PATH
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor
     )
-
-    connexion.row_factory = sqlite3.Row
-
-    return connexion
 
 
 # ============================================================
@@ -225,16 +235,19 @@ def initialiser_base_de_donnees():
 
     # --------------------------------------------------------
     # Étudiants authentifiés via leur adresse @etu.he2b.be.
+    #
+    # BIGINT : les identifiants Discord (snowflakes) dépassent
+    # la capacité d'un INTEGER Postgres classique (32 bits).
     # --------------------------------------------------------
 
     curseur.execute(
         """
         CREATE TABLE IF NOT EXISTS verified_students (
-            discord_user_id INTEGER PRIMARY KEY,
+            discord_user_id BIGINT PRIMARY KEY,
             nom TEXT NOT NULL,
             prenom TEXT NOT NULL,
             email TEXT NOT NULL,
-            verified_at REAL NOT NULL
+            verified_at DOUBLE PRECISION NOT NULL
         )
         """
     )
@@ -256,9 +269,9 @@ def initialiser_base_de_donnees():
     curseur.execute(
         """
         CREATE TABLE IF NOT EXISTS academic_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
 
-            discord_user_id INTEGER NOT NULL,
+            discord_user_id BIGINT NOT NULL,
 
             nom TEXT NOT NULL,
             prenom TEXT NOT NULL,
@@ -271,15 +284,15 @@ def initialiser_base_de_donnees():
 
             status TEXT NOT NULL,
 
-            created_at REAL NOT NULL,
+            created_at DOUBLE PRECISION NOT NULL,
 
-            reviewer_id INTEGER,
-            reviewed_at REAL,
+            reviewer_id BIGINT,
+            reviewed_at DOUBLE PRECISION,
 
             refusal_reason TEXT,
 
-            validation_channel_id INTEGER,
-            validation_message_id INTEGER
+            validation_channel_id BIGINT,
+            validation_message_id BIGINT
         )
         """
     )
@@ -312,15 +325,15 @@ def enregistrer_etudiant_authentifie(
             verified_at
         )
 
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
 
-        ON CONFLICT(discord_user_id)
+        ON CONFLICT (discord_user_id)
         DO UPDATE SET
 
-            nom = excluded.nom,
-            prenom = excluded.prenom,
-            email = excluded.email,
-            verified_at = excluded.verified_at
+            nom = EXCLUDED.nom,
+            prenom = EXCLUDED.prenom,
+            email = EXCLUDED.email,
+            verified_at = EXCLUDED.verified_at
         """,
         (
             discord_user_id,
@@ -346,7 +359,7 @@ def recuperer_etudiant_authentifie(
         """
         SELECT *
         FROM verified_students
-        WHERE discord_user_id = ?
+        WHERE discord_user_id = %s
         """,
         (
             discord_user_id,
@@ -371,7 +384,7 @@ def recuperer_etudiant_par_email(
         """
         SELECT *
         FROM verified_students
-        WHERE LOWER(email) = LOWER(?)
+        WHERE LOWER(email) = LOWER(%s)
         """,
         (
             email,
@@ -415,7 +428,9 @@ def creer_demande_academique(
             created_at
         )
 
-        VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?)
+        VALUES (%s, %s, %s, %s, %s, %s, NULL, 'pending', %s)
+
+        RETURNING id
         """,
         (
             discord_user_id,
@@ -431,7 +446,7 @@ def creer_demande_academique(
         )
     )
 
-    request_id = curseur.lastrowid
+    request_id = curseur.fetchone()["id"]
 
     connexion.commit()
     connexion.close()
@@ -450,7 +465,7 @@ def recuperer_demande(
         """
         SELECT *
         FROM academic_requests
-        WHERE id = ?
+        WHERE id = %s
         """,
         (
             request_id,
@@ -476,7 +491,7 @@ def recuperer_derniere_demande_etudiant(
         SELECT *
         FROM academic_requests
 
-        WHERE discord_user_id = ?
+        WHERE discord_user_id = %s
 
         ORDER BY id DESC
         LIMIT 1
@@ -505,7 +520,7 @@ def recuperer_demande_en_attente_etudiant(
         SELECT *
         FROM academic_requests
 
-        WHERE discord_user_id = ?
+        WHERE discord_user_id = %s
         AND status = 'pending'
 
         ORDER BY id DESC
@@ -557,10 +572,10 @@ def enregistrer_message_validation(
         UPDATE academic_requests
 
         SET
-            validation_channel_id = ?,
-            validation_message_id = ?
+            validation_channel_id = %s,
+            validation_message_id = %s
 
-        WHERE id = ?
+        WHERE id = %s
         """,
         (
             channel_id,
@@ -589,13 +604,13 @@ def enregistrer_decision(
         UPDATE academic_requests
 
         SET
-            status = ?,
-            reviewer_id = ?,
-            reviewed_at = ?,
-            final_profile_key = ?,
-            refusal_reason = ?
+            status = %s,
+            reviewer_id = %s,
+            reviewed_at = %s,
+            final_profile_key = %s,
+            refusal_reason = %s
 
-        WHERE id = ?
+        WHERE id = %s
         """,
         (
             statut,
@@ -3908,7 +3923,7 @@ class ISIBBot(
     async def setup_hook(self):
 
         # ----------------------------------------------------
-        # Base SQLite.
+        # Base de données (crée les tables si absentes).
         # ----------------------------------------------------
 
         initialiser_base_de_donnees()
