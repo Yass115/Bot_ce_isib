@@ -6,6 +6,32 @@ leur adresse `@etu.he2b.be` (code envoyé par mail via Brevo) et gestion des
 inscriptions académiques (cursus / niveau / orientation) avec validation
 interne.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    Dev["Toi (ou Claude)"] -- "git push main" --> GH["GitHub\nyass115/bot_ce_isib"]
+    GH -- "auto-deploy\n(render.yaml)" --> Render["Render\nWeb Service, plan Free"]
+    Cron["Ping externe\n(cron-job.org, /10 min)"] -- "GET /" --> Render
+    Render -- "discord.py" --> Discord["API Discord"]
+    Render -- "envoi des codes" --> Brevo["API Brevo"]
+    Render -- "psycopg2" --> Neon[("Neon PostgreSQL\ndonnées persistantes")]
+```
+
+Le principe : **GitHub est la seule source de vérité du code**, et Render
+redéploie automatiquement à chaque `git push` sur `main`. Le bot
+lui-même tourne en continu sur Render (maintenu éveillé par le ping
+externe), et toutes ses données persistantes vivent hors de Render, sur
+Neon — donc rien n'est perdu si Render redémarre le service.
+
+| Composant | Rôle |
+|---|---|
+| **GitHub** | Héberge le code (`bot.py`). Toute mise à jour part d'ici. |
+| **Render** | Fait tourner le bot 24h/24 (Web Service gratuit). Redéploie automatiquement à chaque push sur `main`. |
+| **Ping externe** (cron-job.org) | Empêche Render de mettre le service en veille (plan Free = veille après 15 min d'inactivité). |
+| **Neon** | Base PostgreSQL externe et persistante : étudiant·e·s authentifié·e·s, demandes académiques. Indépendante des redémarrages de Render. |
+| **Discord / Brevo** | APIs externes utilisées par le bot (connexion Discord, envoi des mails de code). |
+
 ## Fichiers du projet
 
 - `bot.py` — code du bot
@@ -162,6 +188,35 @@ Si tu préfères ne pas utiliser `render.yaml` :
 5. Renseigne les mêmes variables d'environnement que ci-dessus, dont
    `PGHOST`/`PGDATABASE`/`PGUSER`/`PGPASSWORD` (connexion Neon).
 6. Configure le ping externe comme à l'étape 3 ci-dessus.
+
+## Mettre à jour le bot
+
+Le service Render est connecté à la branche `main` avec le déploiement
+automatique activé (`autoDeploy: true`). **Chaque `git push` sur `main`
+déclenche un redéploiement automatique** — rien à faire côté Render.
+
+Deux façons de modifier le code :
+
+1. **Demander à Claude** de faire le changement (commande, texte,
+   comportement...) — il modifie `bot.py`, commit et push sur `main`,
+   Render redéploie tout seul en 1-2 minutes.
+2. **Modifier soi-même** :
+   - directement sur GitHub : ouvre `bot.py` sur
+     `github.com/yass115/bot_ce_isib`, clique l'icône crayon, puis
+     **Commit changes** sur `main` ;
+   - ou en local :
+     ```bash
+     git add .
+     git commit -m "description du changement"
+     git push origin main
+     ```
+
+Suis le déploiement dans l'onglet **Deploys** du service Render.
+
+⚠️ `initialiser_base_de_donnees()` ne fait que **créer** les tables si
+elles n'existent pas (`CREATE TABLE IF NOT EXISTS`) — elle ne modifie
+pas une table déjà existante sur Neon. Un changement de structure sur
+une base contenant déjà des données nécessite une vraie migration.
 
 ## ⚠️ Sécurité — token et clé API
 
