@@ -213,12 +213,12 @@ Deux façons de modifier le code :
 
 Suis le déploiement dans l'onglet **Deploys** du service Render.
 
-⚠️ `initialiser_base_de_donnees()` ne fait que **créer** les tables si
+ `initialiser_base_de_donnees()` ne fait que **créer** les tables si
 elles n'existent pas (`CREATE TABLE IF NOT EXISTS`) — elle ne modifie
 pas une table déjà existante sur Neon. Un changement de structure sur
 une base contenant déjà des données nécessite une vraie migration.
 
-## ⚠️ Sécurité — token et clé API
+## Sécurité — token et clé API
 
 Le token Discord et la clé API Brevo échangés dans la conversation qui a
 servi à préparer ce dépôt **ne sont plus considérés comme secrets** (ils
