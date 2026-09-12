@@ -26,5 +26,15 @@ services:
         sync: false
       - key: VALIDATION_CHANNEL_ID
         sync: false
-      - key: DATABASE_URL
+      - key: PGSSLMODE
+        value: require
+      - key: PGPORT
+        value: "5432"
+      - key: PGHOST
+        sync: false
+      - key: PGDATABASE
+        sync: false
+      - key: PGUSER
+        sync: false
+      - key: PGPASSWORD
         sync: false

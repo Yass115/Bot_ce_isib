@@ -26,7 +26,7 @@ que dans un fichier SQLite local — voir la section suivante. Le fichier
 python -m venv .venv
 source .venv/bin/activate      # Windows : .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env           # puis remplis les valeurs (dont DATABASE_URL)
+cp .env.example .env           # puis remplis les valeurs (dont PGHOST/PGUSER/...)
 python bot.py
 ```
 
@@ -41,14 +41,28 @@ aucune intervention manuelle après une période d'inactivité.
 
 1. Crée un compte gratuit sur [neon.tech](https://neon.tech) (connexion
    possible avec GitHub).
-2. Crée un nouveau projet (ex. nommé `bot-isib`).
-3. Sur la page du projet, va dans **Connection Details** / **Connection
-   string** et copie l'URL au format
-   `postgresql://user:password@host/dbname?sslmode=require`.
-4. **N'envoie jamais cette URL dans un chat** (elle contient un mot de
-   passe) : colle-la uniquement dans le champ `DATABASE_URL` de Render
-   (étape suivante) ou dans ton `.env` local.
-5. Les tables (`verified_students`, `academic_requests`) sont créées
+2. Crée un nouveau projet (ex. nommé `bot-isib`), région Frankfurt.
+3. Sur la page du projet, section **Connect** / **Connection string** :
+   clique le petit menu déroulant à côté (souvent "Connection string" /
+   *Parameters only*) et choisis l'affichage en **paramètres séparés**
+   plutôt que l'URL complète. Tu obtiens alors individuellement :
+   `Host`, `Database`, `User`, `Password`.
+
+   Si seule l'URL complète est disponible, elle a ce format —
+   les parties correspondent aux variables ci-dessous :
+   ```
+   postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require
+   ```
+4. Reporte chaque valeur dans les variables Render correspondantes
+   (`PGHOST`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` — voir tableau
+   plus bas). **On utilise des variables séparées plutôt qu'une seule
+   URL** : coller une longue chaîne `postgresql://user:pass@host/db`
+   dans un champ se corrompt facilement (retour à la ligne, espace
+   ajouté par le copier-coller) et fait planter la connexion.
+5. **N'envoie jamais le mot de passe dans un chat** : colle-le
+   uniquement dans le champ `PGPASSWORD` de Render, ou dans ton `.env`
+   local.
+6. Les tables (`verified_students`, `academic_requests`) sont créées
    automatiquement par le bot à son premier démarrage — rien à faire
    côté Neon.
 
@@ -94,7 +108,13 @@ du bot toutes les 10 minutes, 24h/24.
    | `EMAIL_SENDER_NAME` | Nom affiché de l'expéditeur |
    | `AUDIT_CHANNEL_ID` | ID du salon d'audit |
    | `VALIDATION_CHANNEL_ID` | ID du salon de validation interne |
-   | `DATABASE_URL` | Chaîne de connexion Neon (voir section précédente) |
+   | `PGHOST` | Host Neon (voir section précédente) |
+   | `PGDATABASE` | Nom de la base Neon (souvent `neondb`) |
+   | `PGUSER` | Utilisateur Neon (souvent `neondb_owner`) |
+   | `PGPASSWORD` | Mot de passe Neon |
+
+   `PGPORT` (`5432`) et `PGSSLMODE` (`require`) sont déjà définies dans
+   `render.yaml`, inutile d'y toucher.
 
 5. Clique **Apply**. Render installe les dépendances puis lance
    `python bot.py`. Une fois déployé, note l'URL publique du service
@@ -140,7 +160,7 @@ Si tu préfères ne pas utiliser `render.yaml` :
 3. **Start command** : `python bot.py`
 4. Plan : **Free**.
 5. Renseigne les mêmes variables d'environnement que ci-dessus, dont
-   `DATABASE_URL` (connexion Neon).
+   `PGHOST`/`PGDATABASE`/`PGUSER`/`PGPASSWORD` (connexion Neon).
 6. Configure le ping externe comme à l'étape 3 ci-dessus.
 
 ## ⚠️ Sécurité — token et clé API

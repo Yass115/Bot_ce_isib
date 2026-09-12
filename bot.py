@@ -114,7 +114,19 @@ EMAIL_SENDER_NAME = os.getenv("EMAIL_SENDER_NAME")
 AUDIT_CHANNEL_ID = os.getenv("AUDIT_CHANNEL_ID")
 VALIDATION_CHANNEL_ID = os.getenv("VALIDATION_CHANNEL_ID")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# --------------------------------------------------------------
+# Connexion PostgreSQL (Neon) en paramètres séparés plutôt
+# qu'une seule URL : plus robuste, un simple copier-coller
+# d'une longue chaîne "postgresql://user:pass@host/db?..."
+# se corrompt trop facilement (retour à la ligne, espace...).
+# --------------------------------------------------------------
+
+PGHOST = os.getenv("PGHOST")
+PGPORT = os.getenv("PGPORT", "5432")
+PGDATABASE = os.getenv("PGDATABASE")
+PGUSER = os.getenv("PGUSER")
+PGPASSWORD = os.getenv("PGPASSWORD")
+PGSSLMODE = os.getenv("PGSSLMODE", "require")
 
 
 VARIABLES_OBLIGATOIRES = {
@@ -125,7 +137,10 @@ VARIABLES_OBLIGATOIRES = {
     "EMAIL_SENDER_NAME": EMAIL_SENDER_NAME,
     "AUDIT_CHANNEL_ID": AUDIT_CHANNEL_ID,
     "VALIDATION_CHANNEL_ID": VALIDATION_CHANNEL_ID,
-    "DATABASE_URL": DATABASE_URL,
+    "PGHOST": PGHOST,
+    "PGDATABASE": PGDATABASE,
+    "PGUSER": PGUSER,
+    "PGPASSWORD": PGPASSWORD,
 }
 
 
@@ -218,7 +233,12 @@ intents.members = True
 def connexion_db():
 
     return psycopg2.connect(
-        DATABASE_URL,
+        host=PGHOST,
+        port=PGPORT,
+        dbname=PGDATABASE,
+        user=PGUSER,
+        password=PGPASSWORD,
+        sslmode=PGSSLMODE,
         cursor_factory=RealDictCursor
     )
 
