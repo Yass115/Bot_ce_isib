@@ -59,6 +59,7 @@
 #     10.3 /installer_verification
 #     10.4 /installer_inscription
 #     10.5 /statut_inscription
+#     10.6 /redemarrer_bot
 #
 # 11. DÉMARRAGE
 #
@@ -70,6 +71,7 @@
 # ============================================================
 
 import os
+import sys
 import time
 import secrets
 import asyncio
@@ -113,6 +115,7 @@ EMAIL_SENDER_NAME = os.getenv("EMAIL_SENDER_NAME")
 
 AUDIT_CHANNEL_ID = os.getenv("AUDIT_CHANNEL_ID")
 VALIDATION_CHANNEL_ID = os.getenv("VALIDATION_CHANNEL_ID")
+ADMIN_CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID")
 
 # --------------------------------------------------------------
 # Connexion PostgreSQL (Neon) en paramètres séparés plutôt
@@ -137,6 +140,7 @@ VARIABLES_OBLIGATOIRES = {
     "EMAIL_SENDER_NAME": EMAIL_SENDER_NAME,
     "AUDIT_CHANNEL_ID": AUDIT_CHANNEL_ID,
     "VALIDATION_CHANNEL_ID": VALIDATION_CHANNEL_ID,
+    "ADMIN_CHANNEL_ID": ADMIN_CHANNEL_ID,
     "PGHOST": PGHOST,
     "PGDATABASE": PGDATABASE,
     "PGUSER": PGUSER,
@@ -156,6 +160,7 @@ for nom_variable, valeur in VARIABLES_OBLIGATOIRES.items():
 GUILD_ID = int(GUILD_ID)
 AUDIT_CHANNEL_ID = int(AUDIT_CHANNEL_ID)
 VALIDATION_CHANNEL_ID = int(VALIDATION_CHANNEL_ID)
+ADMIN_CHANNEL_ID = int(ADMIN_CHANNEL_ID)
 
 
 # ============================================================
@@ -5242,6 +5247,107 @@ async def statut_inscription(
     await interaction.response.send_message(
         texte,
         ephemeral=True
+    )
+
+
+# ============================================================
+# 10.6 /REDEMARRER_BOT
+# ============================================================
+#
+# Commande réservée à :
+# - ADMIN DISCORD
+# - COORDINATION CE ISIB
+#
+# Elle ne fonctionne que dans le salon défini par :
+# ADMIN_CHANNEL_ID
+#
+# Le processus Python courant est remplacé par une nouvelle
+# exécution du même bot.py. Cela fonctionne aussi bien en local
+# que sur un hébergement qui autorise le processus Python à se
+# relancer lui-même.
+# ============================================================
+
+@bot.tree.command(
+    name="redemarrer_bot",
+    description="Redémarre le Bot ISIB."
+)
+async def redemarrer_bot(
+    interaction: discord.Interaction
+):
+
+    # --------------------------------------------------------
+    # 1. Vérification du rôle
+    # --------------------------------------------------------
+
+    if not (
+        isinstance(
+            interaction.user,
+            discord.Member
+        )
+        and utilisateur_est_admin_bot(
+            interaction.user
+        )
+    ):
+
+        await interaction.response.send_message(
+            "❌ **PERMISSION INSUFFISANTE**\n\n"
+            "Cette commande est réservée à "
+            "`ADMIN DISCORD` et `COORDINATION CE ISIB`.",
+            ephemeral=True
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # 2. Vérification du salon
+    # --------------------------------------------------------
+
+    if interaction.channel_id != ADMIN_CHANNEL_ID:
+
+        await interaction.response.send_message(
+            "❌ **MAUVAIS SALON**\n\n"
+            "Cette commande doit être utilisée uniquement "
+            "dans `#administration-discord`.",
+            ephemeral=True
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # 3. Confirmation
+    # --------------------------------------------------------
+
+    await interaction.response.send_message(
+        "🔄 **REDÉMARRAGE DU BOT ISIB**\n\n"
+        f"Demandé par {interaction.user.mention}.\n\n"
+        "Le bot va se déconnecter quelques secondes "
+        "puis se reconnecter automatiquement.",
+        ephemeral=True
+    )
+
+    print()
+    print("----------------------------------------")
+    print("🔄 REDÉMARRAGE DU BOT DEMANDÉ")
+    print(
+        f"Par : {interaction.user} "
+        f"({interaction.user.id})"
+    )
+    print("----------------------------------------")
+    print()
+
+    # Laisse le temps à Discord d'afficher la confirmation.
+    await asyncio.sleep(2)
+
+    # --------------------------------------------------------
+    # 4. Redémarrage du processus Python
+    # --------------------------------------------------------
+
+    os.execv(
+        sys.executable,
+        [
+            sys.executable,
+            *sys.argv
+        ]
     )
 
 

@@ -134,6 +134,7 @@ du bot toutes les 10 minutes, 24h/24.
    | `EMAIL_SENDER_NAME` | Nom affiché de l'expéditeur |
    | `AUDIT_CHANNEL_ID` | ID du salon d'audit |
    | `VALIDATION_CHANNEL_ID` | ID du salon de validation interne |
+   | `ADMIN_CHANNEL_ID` | ID du salon `#administration-discord` (seul salon autorisé pour `/redemarrer_bot`) |
    | `PGHOST` | Host Neon (voir section précédente) |
    | `PGDATABASE` | Nom de la base Neon (souvent `neondb`) |
    | `PGUSER` | Utilisateur Neon (souvent `neondb_owner`) |
