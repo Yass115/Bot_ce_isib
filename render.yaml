@@ -1,22 +1,17 @@
 services:
-  - type: worker
+  - type: web
     name: bot-isib
     runtime: python
-    plan: starter
+    plan: free
     region: frankfurt
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     autoDeploy: true
-    disk:
-      name: bot-isib-data
-      mountPath: /var/data
-      sizeGB: 1
+    healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.0
-      - key: DB_PATH
-        value: /var/data/bot_isib.db
       - key: DISCORD_TOKEN
         sync: false
       - key: GUILD_ID

@@ -29,32 +29,38 @@ cp .env.example .env           # puis remplis les valeurs
 python bot.py
 ```
 
-## Déploiement 24h/24 - 7j/7 sur Render
+## Déploiement 24h/24 - 7j/7 sur Render, **gratuitement**
 
-Render ne propose pas de plan gratuit pour un **Background Worker** (le
-type de service adapté à un bot Discord, qui n'écoute aucune requête HTTP
-entrante). Il faut donc un plan payant (**Starter**, ~7 $/mois) pour que
-le bot tourne en continu sans jamais s'éteindre. C'est volontairement ce
-que configure `render.yaml`, avec en plus un petit disque persistant
-(1 Go, quelques centimes/mois) pour que `bot_isib.db` ne soit **pas**
-effacée à chaque redéploiement.
+Render ne propose pas de plan gratuit pour un *Background Worker* (le
+type de service normalement adapté à un bot Discord). Pour rester à
+0 €/mois, ce dépôt déploie donc le bot comme un **Web Service**
+(qui a un plan **Free**), avec un tout petit serveur web (`aiohttp`,
+déjà présent dans `bot.py`) qui ne fait que répondre "OK" sur `/` — cela
+sert uniquement à satisfaire Render (qui exige qu'un Web Service écoute
+sur un port) et à permettre à un service externe de le "réveiller"
+régulièrement.
+
+**Le piège du plan gratuit :** un Web Service Render gratuit se met en
+veille après **15 minutes sans requête HTTP entrante**, et redémarre
+dès qu'une requête arrive (ou dans les ~30 secondes qui suivent). Pour
+empêcher ça, on branche un service de "ping" gratuit qui appelle l'URL
+du bot toutes les 10 minutes, 24h/24.
 
 ### 1. Créer le compte Render et connecter GitHub
 
-1. Va sur [render.com](https://render.com) et crée un compte (tu peux te
-   connecter directement avec GitHub).
+1. Va sur [render.com](https://render.com), crée un compte (connexion
+   directe avec GitHub possible).
 2. Dans **Account Settings → GitHub**, autorise Render à accéder au
-   dépôt `yass115/bot_ce_isib` (accès à ce seul repo, ou à tous — au choix).
+   dépôt `yass115/bot_ce_isib`.
 
 ### 2. Déployer via le Blueprint (`render.yaml`)
 
 1. Sur le dashboard Render, clique **New → Blueprint**.
-2. Sélectionne le dépôt `yass115/bot_ce_isib` et la branche `main`.
-3. Render détecte automatiquement `render.yaml` et propose de créer le
-   service `bot-isib` (Background Worker + disque persistant).
-4. Avant de valider, Render te demande de renseigner les variables
-   marquées `sync: false` (elles ne sont **jamais** stockées dans le
-   dépôt) :
+2. Sélectionne le dépôt `yass115/bot_ce_isib`, branche `main`.
+3. Render détecte `render.yaml` et propose de créer le service `bot-isib`
+   (Web Service, plan **Free**).
+4. Renseigne les variables marquées `sync: false` (jamais stockées dans
+   le dépôt) :
 
    | Variable | Valeur |
    |---|---|
@@ -66,32 +72,65 @@ effacée à chaque redéploiement.
    | `AUDIT_CHANNEL_ID` | ID du salon d'audit |
    | `VALIDATION_CHANNEL_ID` | ID du salon de validation interne |
 
-   `DB_PATH` et `PYTHON_VERSION` sont déjà définies dans `render.yaml`,
-   inutile d'y toucher.
+5. Clique **Apply**. Render installe les dépendances puis lance
+   `python bot.py`. Une fois déployé, note l'URL publique du service
+   (ex. `https://bot-isib.onrender.com`) — Render l'affiche en haut de
+   la page du service.
 
-5. Clique **Apply** — Render installe les dépendances (`pip install -r
-   requirements.txt`) puis lance `python bot.py`. Le bot doit apparaître
-   en ligne sur Discord au bout de 1 à 2 minutes.
+### 3. Empêcher la mise en veille (ping externe gratuit)
 
-### 3. Déploiement continu
+Utilise un service de cron gratuit, par exemple
+[cron-job.org](https://cron-job.org) ou
+[UptimeRobot](https://uptimerobot.com) :
+
+1. Crée un compte gratuit.
+2. Ajoute un nouveau job/moniteur :
+   - URL : `https://bot-isib.onrender.com` (ton URL Render)
+   - Intervalle : **toutes les 10 minutes** (moins que les 15 min de
+     seuil de mise en veille de Render)
+3. Sauvegarde. C'est tout — tant que ce ping tourne, le service Render
+   reste éveillé en continu et le bot Discord reste connecté 24h/24.
+
+### 4. Déploiement continu
 
 Une fois branché, **chaque `git push` sur `main`** déclenche
-automatiquement un nouveau déploiement (`autoDeploy: true`). Tu n'as
-plus rien à faire manuellement ensuite.
+automatiquement un nouveau déploiement (`autoDeploy: true`).
+
+### ⚠️ Limite du plan gratuit : pas de stockage persistant
+
+Le plan **Free** de Render ne permet pas d'attacher de disque
+persistant. Résultat : à chaque redémarrage du service (redéploiement,
+ou un redémarrage imposé par Render), le fichier `bot_isib.db` repart
+de zéro — **les étudiant·e·s déjà authentifié·e·s et l'historique des
+demandes académiques sont perdus**. Le ping externe limite les
+redémarrages liés à l'inactivité, mais ne les supprime pas totalement
+(maintenance Render, déploiements, etc.).
+
+Si la conservation durable de ces données est importante (ce qui est
+probablement le cas ici), les options sont :
+
+1. **Passer le service en Background Worker + disque persistant**
+   (~7 $/mois) — solution la plus simple et la plus fiable, voir
+   git history de ce fichier pour la configuration correspondante.
+2. **Utiliser une base de données externe gratuite** (ex. Postgres
+   gratuit chez [Supabase](https://supabase.com) ou
+   [Neon](https://neon.tech), ou SQLite distant via
+   [Turso](https://turso.tech)) à la place du fichier SQLite local —
+   demande une petite adaptation du code de `bot.py`.
+
+Dis-moi si tu veux que je mette en place l'une de ces deux options.
 
 ### Sans Blueprint (méthode manuelle, alternative)
 
 Si tu préfères ne pas utiliser `render.yaml` :
 
-1. **New → Background Worker**, connecte le repo `yass115/bot_ce_isib`,
+1. **New → Web Service**, connecte le repo `yass115/bot_ce_isib`,
    branche `main`.
 2. **Build command** : `pip install -r requirements.txt`
 3. **Start command** : `python bot.py`
-4. Plan : **Starter** minimum (pas de gratuit pour un Background Worker).
-5. Ajoute un disque : **Disks → Add Disk**, mount path `/var/data`,
-   1 Go.
-6. Renseigne les mêmes variables d'environnement que ci-dessus, plus
-   `DB_PATH=/var/data/bot_isib.db`.
+4. Plan : **Free**.
+5. Renseigne les mêmes variables d'environnement que ci-dessus.
+6. Configure le ping externe comme à l'étape 3 ci-dessus.
 
 ## ⚠️ Sécurité — token et clé API
 

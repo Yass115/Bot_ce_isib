@@ -4279,5 +4279,65 @@ async def statut_inscription(
 # ============================================================
 # 11. DÉMARRAGE
 # ============================================================
+#
+# Un mini serveur web (aiohttp) tourne en parallèle du bot.
+#
+# Il ne sert à rien pour Discord : il existe uniquement pour
+# satisfaire Render, qui exige qu'un "Web Service" réponde sur
+# le port $PORT, et pour permettre à un service externe de
+# "ping" régulièrement l'app afin d'empêcher le plan gratuit
+# de se mettre en veille après 15 minutes d'inactivité.
+#
+# Voir README.md, section "Déploiement 24h/24 gratuit".
+# ============================================================
 
-bot.run(TOKEN)
+from aiohttp import web
+
+
+async def page_accueil(request):
+
+    return web.Response(
+        text="✅ Bot ISIB en ligne."
+    )
+
+
+async def demarrer_serveur_web():
+
+    app = web.Application()
+
+    app.router.add_get(
+        "/",
+        page_accueil
+    )
+
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    port = int(
+        os.getenv("PORT", 10000)
+    )
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        port
+    )
+
+    await site.start()
+
+    print(
+        f"✅ Serveur web (keep-alive) démarré sur le port {port}."
+    )
+
+
+async def main():
+
+    await demarrer_serveur_web()
+
+    async with bot:
+
+        await bot.start(TOKEN)
+
+
+asyncio.run(main())
