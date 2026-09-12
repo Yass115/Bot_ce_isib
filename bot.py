@@ -34,21 +34,20 @@
 #
 # 5. PANNEAU D'AUTHENTIFICATION
 #
-# 6. INSCRIPTIONS ACADÉMIQUES
-#    6.1 Profils académiques
-#    6.2 Lecture des rôles académiques actuels
-#    6.3 Choix du cursus
-#    6.4 Choix de l'année/niveau
-#    6.5 Choix de l'orientation
-#    6.6 Récapitulatif
-#    6.7 Création de la demande
+# 6. INSCRIPTIONS ACADÉMIQUES — SÉLECTION MULTI-RÔLES
+#    6.1 Registre des rôles académiques
+#    6.2 Lecture / formatage des rôles
+#    6.3 Interface de sélection multi-rôles
+#    6.4 Récapitulatif étudiant
+#    6.5 Création sécurisée de la demande
 #
 # 7. VALIDATION INTERNE CE ISIB
 #    7.1 Fiche de validation
-#    7.2 Application d'un profil
-#    7.3 Validation
-#    7.4 Correction
-#    7.5 Refus
+#    7.2 Application exacte des rôles
+#    7.3 Validation et notification
+#    7.4 Boutons Valider / Modifier / Refuser
+#    7.5 Modification CE par sélection multi-rôles
+#    7.6 Refus
 #
 # 8. PANNEAU D'INSCRIPTION ACADÉMIQUE
 #
@@ -250,11 +249,13 @@ def connexion_db():
 def initialiser_base_de_donnees():
 
     connexion = connexion_db()
-
     curseur = connexion.cursor()
 
     # --------------------------------------------------------
     # Étudiants authentifiés via leur adresse @etu.he2b.be.
+    #
+    # Cette table appartient à la PARTIE AUTHENTIFICATION.
+    # Sa structure reste inchangée.
     #
     # BIGINT : les identifiants Discord (snowflakes) dépassent
     # la capacité d'un INTEGER Postgres classique (32 bits).
@@ -273,17 +274,16 @@ def initialiser_base_de_donnees():
     )
 
     # --------------------------------------------------------
-    # Historique permanent des demandes académiques.
+    # Historique des demandes académiques.
     #
-    # current_roles_json :
-    # rôles académiques réellement possédés au moment
-    # où la demande a été introduite.
+    # Les anciennes colonnes requested_profile_key et
+    # final_profile_key sont conservées afin de ne pas casser
+    # l'historique déjà présent dans la base.
     #
-    # requested_profile_key :
-    # ce que l'étudiant a demandé.
+    # Le nouveau système utilise :
     #
-    # final_profile_key :
-    # ce que le CE a finalement validé.
+    # requested_roles_json = liste exacte des rôles demandés
+    # final_roles_json     = liste exacte validée par le CE
     # --------------------------------------------------------
 
     curseur.execute(
@@ -302,6 +302,9 @@ def initialiser_base_de_donnees():
             requested_profile_key TEXT NOT NULL,
             final_profile_key TEXT,
 
+            requested_roles_json TEXT,
+            final_roles_json TEXT,
+
             status TEXT NOT NULL,
 
             created_at DOUBLE PRECISION NOT NULL,
@@ -315,6 +318,26 @@ def initialiser_base_de_donnees():
             validation_message_id BIGINT
         )
         """
+    )
+
+    # --------------------------------------------------------
+    # MIGRATION AUTOMATIQUE D'UNE ANCIENNE BASE
+    #
+    # Contrairement à SQLite, PostgreSQL sait ajouter une
+    # colonne uniquement si elle n'existe pas déjà : ces deux
+    # instructions ne font rien si les colonnes sont déjà
+    # présentes (base déjà migrée, ou table nouvellement créée
+    # ci-dessus avec ces colonnes incluses).
+    # --------------------------------------------------------
+
+    curseur.execute(
+        "ALTER TABLE academic_requests "
+        "ADD COLUMN IF NOT EXISTS requested_roles_json TEXT"
+    )
+
+    curseur.execute(
+        "ALTER TABLE academic_requests "
+        "ADD COLUMN IF NOT EXISTS final_roles_json TEXT"
     )
 
     connexion.commit()
@@ -428,7 +451,7 @@ def creer_demande_academique(
     prenom: str,
     email: str,
     roles_actuels: list[str],
-    profile_key: str
+    roles_demandes: list[str]
 ) -> int:
 
     connexion = connexion_db()
@@ -444,11 +467,16 @@ def creer_demande_academique(
             current_roles_json,
             requested_profile_key,
             final_profile_key,
+            requested_roles_json,
+            final_roles_json,
             status,
             created_at
         )
 
-        VALUES (%s, %s, %s, %s, %s, %s, NULL, 'pending', %s)
+        VALUES (
+            %s, %s, %s, %s, %s,
+            'multi_roles', NULL, %s, NULL, 'pending', %s
+        )
 
         RETURNING id
         """,
@@ -461,7 +489,10 @@ def creer_demande_academique(
                 roles_actuels,
                 ensure_ascii=False
             ),
-            profile_key,
+            json.dumps(
+                roles_demandes,
+                ensure_ascii=False
+            ),
             time.time()
         )
     )
@@ -608,16 +639,74 @@ def enregistrer_message_validation(
     connexion.close()
 
 
+
+def supprimer_demande_academique(
+    request_id: int
+):
+
+    connexion = connexion_db()
+    curseur = connexion.cursor()
+
+    curseur.execute(
+        """
+        DELETE FROM academic_requests
+        WHERE id = %s
+        """,
+        (
+            request_id,
+        )
+    )
+
+    connexion.commit()
+    connexion.close()
+
+
+def nettoyer_demandes_orphelines():
+
+    connexion = connexion_db()
+    curseur = connexion.cursor()
+
+    curseur.execute(
+        """
+        DELETE FROM academic_requests
+
+        WHERE status = 'pending'
+        AND validation_message_id IS NULL
+        """
+    )
+
+    nombre = curseur.rowcount
+
+    connexion.commit()
+    connexion.close()
+
+    if nombre > 0:
+
+        print(
+            f"🧹 {nombre} demande(s) académique(s) "
+            "orpheline(s) supprimée(s)."
+        )
+
+
 def enregistrer_decision(
     request_id: int,
     statut: str,
     reviewer_id: int,
-    final_profile_key=None,
+    final_roles: list[str] | None = None,
     refusal_reason=None
 ):
 
     connexion = connexion_db()
     curseur = connexion.cursor()
+
+    final_roles_json = (
+        json.dumps(
+            final_roles,
+            ensure_ascii=False
+        )
+        if final_roles is not None
+        else None
+    )
 
     curseur.execute(
         """
@@ -627,7 +716,8 @@ def enregistrer_decision(
             status = %s,
             reviewer_id = %s,
             reviewed_at = %s,
-            final_profile_key = %s,
+            final_profile_key = NULL,
+            final_roles_json = %s,
             refusal_reason = %s
 
         WHERE id = %s
@@ -636,7 +726,7 @@ def enregistrer_decision(
             statut,
             reviewer_id,
             time.time(),
-            final_profile_key,
+            final_roles_json,
             refusal_reason,
             request_id
         )
@@ -752,6 +842,21 @@ def trouver_role_etudiant_verifie(
         guild.roles,
         name=NOM_ROLE_ETUDIANT_VERIFIE
     )
+
+
+# ============================================================
+# PARTIE A — AUTHENTIFICATION ÉTUDIANTE
+# ============================================================
+#
+# Cette partie gère :
+# - l'adresse @etu.he2b.be ;
+# - le code Brevo ;
+# - le rôle ÉTUDIANT ISIB - HE2B VÉRIFIÉ ;
+# - l'audit des authentifications.
+#
+# IMPORTANT : logique conservée telle quelle.
+#
+# ============================================================
 
 
 # ============================================================
@@ -1622,394 +1727,390 @@ async def replacer_panneau_verification(
 
 
 # ============================================================
+# PARTIE B — INSCRIPTIONS ACADÉMIQUES / ACCÈS AUX COURS
+# ============================================================
+#
+# Cette partie est volontairement séparée de l'authentification.
+#
+# PRINCIPE :
+#
+# 1. L'étudiant doit déjà être authentifié.
+# 2. Ses rôles académiques actuels sont pré-cochés en vert.
+# 3. Il peut sélectionner PLUSIEURS rôles académiques via
+#    des boutons cochables répartis sur plusieurs pages.
+# 4. Il envoie une demande unique contenant la liste complète
+#    des rôles qu'il souhaite conserver / obtenir.
+# 5. Le CE ISIB peut :
+#       ✅ VALIDER
+#       ✏️ MODIFIER
+#       ❌ REFUSER
+# 6. Une validation applique EXACTEMENT la liste retenue :
+#       - rôles cochés     => conservés / ajoutés
+#       - rôles décochés   => retirés
+# 7. Le rôle de vérification n'est JAMAIS modifiable ici.
+#
+# ============================================================
+
+
+# ============================================================
 # 6. INSCRIPTIONS ACADÉMIQUES
 # ============================================================
 
 
 # ============================================================
-# 6.1 PROFILS ACADÉMIQUES
+# 6.1 REGISTRE DES RÔLES ACADÉMIQUES
 # ============================================================
 #
-# ATTENTION :
-# les chaînes placées dans "roles" doivent porter
-# EXACTEMENT le même nom que les rôles Discord.
+# Les noms ci-dessous doivent correspondre EXACTEMENT aux noms
+# de rôles présents sur Discord.
 #
-# Si un rôle sur ton Discord s'appelle différemment,
-# il suffit de modifier son nom ici.
+# Les rôles sont répartis en 6 onglets visuels.
+# Chaque rôle est représenté par un bouton :
+#     ✅ vert = sélectionné
+#     ⬜ gris = non sélectionné
 #
+# Cela simule des cases à cocher de façon plus intuitive
+# que plusieurs menus déroulants.
+#
+# Le rôle :
+#     ÉTUDIANT ISIB - HE2B VÉRIFIÉ
+# n'est volontairement PAS dans cette liste.
+#
+# Il reste géré uniquement par la PARTIE AUTHENTIFICATION.
 # ============================================================
 
-PROFILS_ACADEMIQUES = {
+GROUPES_ROLES_ACADEMIQUES = [
 
     # --------------------------------------------------------
-    # BAPSIE
+    # ONGLET 1 — BAPSIE
     # --------------------------------------------------------
-
-    "bapsie_b1": {
-        "cursus": "BAPSIE",
-        "niveau": "B1",
-        "option": None,
+    {
+        "key": "bapsie",
+        "label": "BAPSIE",
+        "tab_label": "BAPSIE",
+        "general_role": None,
         "roles": [
-            "B1 BAPSIE"
-        ]
+            "B1 BAPSIE",
+            "B2 BAPSIE",
+            "B3 BAPSIE",
+        ],
     },
 
-    "bapsie_b2": {
-        "cursus": "BAPSIE",
-        "niveau": "B2",
-        "option": None,
+    # --------------------------------------------------------
+    # ONGLET 2 — B1 INGÉNIERIE
+    # --------------------------------------------------------
+    {
+        "key": "b1_ing",
+        "label": "B1 Ingénierie",
+        "tab_label": "B1 ING",
+        "general_role": "B1 INGÉNIERIE",
         "roles": [
-            "B2 BAPSIE"
-        ]
+            "B1 INGÉNIERIE",
+        ],
     },
 
-    "bapsie_b3": {
-        "cursus": "BAPSIE",
-        "niveau": "B3",
-        "option": None,
-        "roles": [
-            "B3 BAPSIE"
-        ]
-    },
-
-
     # --------------------------------------------------------
-    # INGÉNIERIE - B1
+    # ONGLET 3 — B2 INGÉNIERIE
+    # Rôle général + options
     # --------------------------------------------------------
-
-    "ing_b1": {
-        "cursus": "Ingénierie",
-        "niveau": "B1",
-        "option": None,
-        "roles": [
-            "B1 INGÉNIERIE"
-        ]
-    },
-
-
-    # --------------------------------------------------------
-    # INGÉNIERIE - B2
-    # --------------------------------------------------------
-
-    "ing_b2_chimie": {
-        "cursus": "Ingénierie",
-        "niveau": "B2",
-        "option": "Chimie",
+    {
+        "key": "b2_ing",
+        "label": "B2 Ingénierie",
+        "tab_label": "B2 ING",
+        "general_role": "B2 INGÉNIERIE",
         "roles": [
             "B2 INGÉNIERIE",
-            "B2 CHIMIE"
-        ]
+            "B2 CHIMIE",
+            "B2 PHYSIQUE",
+            "B2 MÉCANIQUE",
+            "B2 ÉLECTRICITÉ - ÉLECTRONIQUE - INFORMATIQUE",
+        ],
     },
-
-    "ing_b2_physique": {
-        "cursus": "Ingénierie",
-        "niveau": "B2",
-        "option": "Physique",
-        "roles": [
-            "B2 INGÉNIERIE",
-            "B2 PHYSIQUE"
-        ]
-    },
-
-    "ing_b2_mecanique": {
-        "cursus": "Ingénierie",
-        "niveau": "B2",
-        "option": "Mécanique",
-        "roles": [
-            "B2 INGÉNIERIE",
-            "B2 MÉCANIQUE"
-        ]
-    },
-
-    "ing_b2_eei": {
-        "cursus": "Ingénierie",
-        "niveau": "B2",
-        "option": (
-            "Électricité - Électronique - Informatique"
-        ),
-        "roles": [
-            "B2 INGÉNIERIE",
-            "B2 ÉLECTRICITÉ - ÉLECTRONIQUE - INFORMATIQUE"
-        ]
-    },
-
 
     # --------------------------------------------------------
-    # INGÉNIERIE - B3 & BC
+    # ONGLET 4 — B3 & BC INGÉNIERIE
+    # Rôle général + options
     # --------------------------------------------------------
-
-    "ing_b3bc_chimie": {
-        "cursus": "Ingénierie",
-        "niveau": "B3 & BC",
-        "option": "Chimie",
+    {
+        "key": "b3bc_ing",
+        "label": "B3 & BC Ingénierie",
+        "tab_label": "B3 & BC ING",
+        "general_role": "B3 & BC INGÉNIERIE",
         "roles": [
             "B3 & BC INGÉNIERIE",
-            "B3 & BC CHIMIE"
-        ]
+            "B3 & BC CHIMIE",
+            "B3 & BC PHYSIQUE",
+            "B3 & BC MÉCANIQUE",
+            "B3 & BC ÉLECTRICITÉ - ÉLECTRONIQUE - INFORMATIQUE",
+        ],
     },
-
-    "ing_b3bc_physique": {
-        "cursus": "Ingénierie",
-        "niveau": "B3 & BC",
-        "option": "Physique",
-        "roles": [
-            "B3 & BC INGÉNIERIE",
-            "B3 & BC PHYSIQUE"
-        ]
-    },
-
-    "ing_b3bc_mecanique": {
-        "cursus": "Ingénierie",
-        "niveau": "B3 & BC",
-        "option": "Mécanique",
-        "roles": [
-            "B3 & BC INGÉNIERIE",
-            "B3 & BC MÉCANIQUE"
-        ]
-    },
-
-    "ing_b3bc_eei": {
-        "cursus": "Ingénierie",
-        "niveau": "B3 & BC",
-        "option": (
-            "Électricité - Électronique - Informatique"
-        ),
-        "roles": [
-            "B3 & BC INGÉNIERIE",
-            "B3 & BC ÉLECTRICITÉ - ÉLECTRONIQUE - INFORMATIQUE"
-        ]
-    },
-
 
     # --------------------------------------------------------
-    # INGÉNIERIE - M1
+    # ONGLET 5 — M1 INGÉNIERIE
+    # Rôle général + options
     # --------------------------------------------------------
-
-    "ing_m1_chimie": {
-        "cursus": "Ingénierie",
-        "niveau": "M1",
-        "option": "Chimie",
+    {
+        "key": "m1_ing",
+        "label": "M1 Ingénierie",
+        "tab_label": "M1 ING",
+        "general_role": "M1 INGÉNIERIE",
         "roles": [
             "M1 INGÉNIERIE",
-            "M1 CHIMIE"
-        ]
+            "M1 CHIMIE",
+            "M1 PHYSIQUE",
+            "M1 MÉCANIQUE",
+            "M1 ÉLECTRICITÉ",
+            "M1 ÉLECTRONIQUE",
+            "M1 INFORMATIQUE",
+        ],
     },
-
-    "ing_m1_physique": {
-        "cursus": "Ingénierie",
-        "niveau": "M1",
-        "option": "Physique",
-        "roles": [
-            "M1 INGÉNIERIE",
-            "M1 PHYSIQUE"
-        ]
-    },
-
-    "ing_m1_mecanique": {
-        "cursus": "Ingénierie",
-        "niveau": "M1",
-        "option": "Mécanique",
-        "roles": [
-            "M1 INGÉNIERIE",
-            "M1 MÉCANIQUE"
-        ]
-    },
-
-    "ing_m1_electricite": {
-        "cursus": "Ingénierie",
-        "niveau": "M1",
-        "option": "Électricité",
-        "roles": [
-            "M1 INGÉNIERIE",
-            "M1 ÉLECTRICITÉ"
-        ]
-    },
-
-    "ing_m1_electronique": {
-        "cursus": "Ingénierie",
-        "niveau": "M1",
-        "option": "Électronique",
-        "roles": [
-            "M1 INGÉNIERIE",
-            "M1 ÉLECTRONIQUE"
-        ]
-    },
-
-    "ing_m1_informatique": {
-        "cursus": "Ingénierie",
-        "niveau": "M1",
-        "option": "Informatique",
-        "roles": [
-            "M1 INGÉNIERIE",
-            "M1 INFORMATIQUE"
-        ]
-    },
-
 
     # --------------------------------------------------------
-    # INGÉNIERIE - M2
+    # ONGLET 6 — M2 INGÉNIERIE
+    # Rôle général + options
     # --------------------------------------------------------
-
-    "ing_m2_chimie": {
-        "cursus": "Ingénierie",
-        "niveau": "M2",
-        "option": "Chimie",
+    {
+        "key": "m2_ing",
+        "label": "M2 Ingénierie",
+        "tab_label": "M2 ING",
+        "general_role": "M2 INGÉNIERIE",
         "roles": [
             "M2 INGÉNIERIE",
-            "M2 CHIMIE"
-        ]
+            "M2 CHIMIE",
+            "M2 PHYSIQUE",
+            "M2 MÉCANIQUE",
+            "M2 ÉLECTRICITÉ",
+            "M2 ÉLECTRONIQUE",
+            "M2 INFORMATIQUE",
+        ],
     },
+]
 
-    "ing_m2_physique": {
-        "cursus": "Ingénierie",
-        "niveau": "M2",
-        "option": "Physique",
-        "roles": [
-            "M2 INGÉNIERIE",
-            "M2 PHYSIQUE"
-        ]
-    },
+# ------------------------------------------------------------
+# Compatibilité avec les anciennes demandes déjà enregistrées
+# avant le passage au système multi-rôles.
+#
+# Ce dictionnaire n'est PLUS utilisé pour créer les nouvelles
+# demandes. Il sert uniquement à relire l'ancien historique.
+# ------------------------------------------------------------
 
-    "ing_m2_mecanique": {
-        "cursus": "Ingénierie",
-        "niveau": "M2",
-        "option": "Mécanique",
-        "roles": [
-            "M2 INGÉNIERIE",
-            "M2 MÉCANIQUE"
-        ]
-    },
+PROFILS_ACADEMIQUES_LEGACY = {
 
-    "ing_m2_electricite": {
-        "cursus": "Ingénierie",
-        "niveau": "M2",
-        "option": "Électricité",
-        "roles": [
-            "M2 INGÉNIERIE",
-            "M2 ÉLECTRICITÉ"
-        ]
-    },
+    "bapsie_b1": [
+        "B1 BAPSIE"
+    ],
 
-    "ing_m2_electronique": {
-        "cursus": "Ingénierie",
-        "niveau": "M2",
-        "option": "Électronique",
-        "roles": [
-            "M2 INGÉNIERIE",
-            "M2 ÉLECTRONIQUE"
-        ]
-    },
+    "bapsie_b2": [
+        "B2 BAPSIE"
+    ],
 
-    "ing_m2_informatique": {
-        "cursus": "Ingénierie",
-        "niveau": "M2",
-        "option": "Informatique",
-        "roles": [
-            "M2 INGÉNIERIE",
-            "M2 INFORMATIQUE"
-        ]
-    },
+    "bapsie_b3": [
+        "B3 BAPSIE"
+    ],
+
+    "ing_b1": [
+        "B1 INGÉNIERIE"
+    ],
+
+    "ing_b2_chimie": [
+        "B2 INGÉNIERIE",
+        "B2 CHIMIE"
+    ],
+
+    "ing_b2_physique": [
+        "B2 INGÉNIERIE",
+        "B2 PHYSIQUE"
+    ],
+
+    "ing_b2_mecanique": [
+        "B2 INGÉNIERIE",
+        "B2 MÉCANIQUE"
+    ],
+
+    "ing_b2_eei": [
+        "B2 INGÉNIERIE",
+        "B2 ÉLECTRICITÉ - ÉLECTRONIQUE - INFORMATIQUE"
+    ],
+
+    "ing_b3bc_chimie": [
+        "B3 & BC INGÉNIERIE",
+        "B3 & BC CHIMIE"
+    ],
+
+    "ing_b3bc_physique": [
+        "B3 & BC INGÉNIERIE",
+        "B3 & BC PHYSIQUE"
+    ],
+
+    "ing_b3bc_mecanique": [
+        "B3 & BC INGÉNIERIE",
+        "B3 & BC MÉCANIQUE"
+    ],
+
+    "ing_b3bc_eei": [
+        "B3 & BC INGÉNIERIE",
+        "B3 & BC ÉLECTRICITÉ - ÉLECTRONIQUE - INFORMATIQUE"
+    ],
+
+    "ing_m1_chimie": [
+        "M1 INGÉNIERIE",
+        "M1 CHIMIE"
+    ],
+
+    "ing_m1_physique": [
+        "M1 INGÉNIERIE",
+        "M1 PHYSIQUE"
+    ],
+
+    "ing_m1_mecanique": [
+        "M1 INGÉNIERIE",
+        "M1 MÉCANIQUE"
+    ],
+
+    "ing_m1_electricite": [
+        "M1 INGÉNIERIE",
+        "M1 ÉLECTRICITÉ"
+    ],
+
+    "ing_m1_electronique": [
+        "M1 INGÉNIERIE",
+        "M1 ÉLECTRONIQUE"
+    ],
+
+    "ing_m1_informatique": [
+        "M1 INGÉNIERIE",
+        "M1 INFORMATIQUE"
+    ],
+
+    "ing_m2_chimie": [
+        "M2 INGÉNIERIE",
+        "M2 CHIMIE"
+    ],
+
+    "ing_m2_physique": [
+        "M2 INGÉNIERIE",
+        "M2 PHYSIQUE"
+    ],
+
+    "ing_m2_mecanique": [
+        "M2 INGÉNIERIE",
+        "M2 MÉCANIQUE"
+    ],
+
+    "ing_m2_electricite": [
+        "M2 INGÉNIERIE",
+        "M2 ÉLECTRICITÉ"
+    ],
+
+    "ing_m2_electronique": [
+        "M2 INGÉNIERIE",
+        "M2 ÉLECTRONIQUE"
+    ],
+
+    "ing_m2_informatique": [
+        "M2 INGÉNIERIE",
+        "M2 INFORMATIQUE"
+    ],
 }
 
 
 # ============================================================
-# 6.2 LECTURE DES RÔLES ACADÉMIQUES ACTUELS
+# 6.2 LECTURE / FORMATAGE DES RÔLES
 # ============================================================
 
-def obtenir_tous_noms_roles_academiques():
+def obtenir_tous_noms_roles_academiques() -> list[str]:
 
-    noms = set()
+    roles = []
 
-    for profil in PROFILS_ACADEMIQUES.values():
+    for groupe in GROUPES_ROLES_ACADEMIQUES:
 
-        noms.update(
-            profil["roles"]
-        )
+        for nom_role in groupe["roles"]:
 
-    return noms
+            if nom_role not in roles:
+
+                roles.append(
+                    nom_role
+                )
+
+    return roles
+
+
+def normaliser_roles_academiques(
+    roles: list[str] | set[str]
+) -> list[str]:
+
+    demandes = set(
+        roles
+    )
+
+    return [
+        nom_role
+        for nom_role in obtenir_tous_noms_roles_academiques()
+        if nom_role in demandes
+    ]
 
 
 def lire_roles_academiques_membre(
     member: discord.Member
 ) -> list[str]:
 
-    noms_roles_academiques = (
+    noms_roles = set(
         obtenir_tous_noms_roles_academiques()
     )
 
-    roles_trouves = [
+    roles_membre = {
         role.name
         for role in member.roles
-        if role.name in noms_roles_academiques
-    ]
+        if role.name in noms_roles
+    }
 
-    return roles_trouves
-
-
-def description_profil(
-    profile_key: str
-) -> str:
-
-    profil = PROFILS_ACADEMIQUES[
-        profile_key
-    ]
-
-    texte = (
-        f"{profil['niveau']} "
-        f"{profil['cursus']}"
+    return normaliser_roles_academiques(
+        roles_membre
     )
 
-    if profil["option"]:
 
-        texte += (
-            f" — {profil['option']}"
-        )
+def formater_roles(
+    roles: list[str] | set[str],
+    vide="• Aucun rôle académique"
+) -> str:
 
-    return texte
+    roles_ordonnes = normaliser_roles_academiques(
+        roles
+    )
 
+    if not roles_ordonnes:
 
-def trouver_profile_key(
-    cursus: str,
-    niveau: str,
-    option=None
-):
+        return vide
 
-    for cle, profil in PROFILS_ACADEMIQUES.items():
-
-        if (
-            profil["cursus"] == cursus
-            and profil["niveau"] == niveau
-            and profil["option"] == option
-        ):
-
-            return cle
-
-    return None
+    return "\n".join(
+        f"• `{role}`"
+        for role in roles_ordonnes
+    )
 
 
 def calculer_modifications_roles(
     roles_actuels: list[str],
-    roles_demandes: list[str]
+    roles_finaux: list[str]
 ):
 
-    anciens = set(
+    actuels = set(
         roles_actuels
     )
 
-    nouveaux = set(
-        roles_demandes
+    finaux = set(
+        roles_finaux
     )
 
-    a_retirer = sorted(
-        anciens - nouveaux
+    a_retirer = normaliser_roles_academiques(
+        actuels - finaux
     )
 
-    a_ajouter = sorted(
-        nouveaux - anciens
+    a_ajouter = normaliser_roles_academiques(
+        finaux - actuels
     )
 
-    conserves = sorted(
-        anciens & nouveaux
+    conserves = normaliser_roles_academiques(
+        actuels & finaux
     )
 
     return (
@@ -2019,259 +2120,394 @@ def calculer_modifications_roles(
     )
 
 
-# ============================================================
-# 6.3 CHOIX DU CURSUS
-# ============================================================
+def roles_demandes_depuis_demande(
+    demande
+) -> list[str]:
 
-class CursusSelect(
-    discord.ui.Select
-):
+    if not demande:
 
-    def __init__(self):
+        return []
 
-        super().__init__(
-            placeholder="Sélectionnez votre cursus",
-            min_values=1,
-            max_values=1,
+    colonnes = set(
+        demande.keys()
+    )
 
-            options=[
-                discord.SelectOption(
-                    label="Ingénierie",
-                    value="Ingénierie",
-                    emoji="⚙️"
-                ),
-
-                discord.SelectOption(
-                    label="BAPSIE",
-                    value="BAPSIE",
-                    emoji="🎓"
-                ),
-            ]
-        )
-
-    async def callback(
-        self,
-        interaction: discord.Interaction
+    if (
+        "requested_roles_json" in colonnes
+        and demande["requested_roles_json"]
     ):
 
-        cursus = self.values[0]
+        try:
 
-        await interaction.response.edit_message(
-            content=(
-                "🎓 **INSCRIPTION ACADÉMIQUE**\n\n"
-                f"Cursus sélectionné : **{cursus}**\n\n"
-                "Sélectionnez maintenant votre niveau :"
-            ),
-
-            view=NiveauView(
-                cursus
-            )
-        )
-
-
-class CursusView(
-    discord.ui.View
-):
-
-    def __init__(self):
-
-        super().__init__(
-            timeout=300
-        )
-
-        self.add_item(
-            CursusSelect()
-        )
-
-
-# ============================================================
-# 6.4 CHOIX DU NIVEAU
-# ============================================================
-
-class NiveauSelect(
-    discord.ui.Select
-):
-
-    def __init__(
-        self,
-        cursus: str
-    ):
-
-        self.cursus = cursus
-
-        if cursus == "BAPSIE":
-
-            niveaux = [
-                "B1",
-                "B2",
-                "B3"
-            ]
-
-        else:
-
-            niveaux = [
-                "B1",
-                "B2",
-                "B3 & BC",
-                "M1",
-                "M2"
-            ]
-
-        super().__init__(
-            placeholder="Sélectionnez votre niveau",
-            min_values=1,
-            max_values=1,
-
-            options=[
-                discord.SelectOption(
-                    label=niveau,
-                    value=niveau
+            return normaliser_roles_academiques(
+                json.loads(
+                    demande["requested_roles_json"]
                 )
-
-                for niveau in niveaux
-            ]
-        )
-
-    async def callback(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        niveau = self.values[0]
-
-        # ----------------------------------------------------
-        # BAPSIE n'a pas de choix d'orientation ici.
-        # ----------------------------------------------------
-
-        if self.cursus == "BAPSIE":
-
-            profile_key = trouver_profile_key(
-                "BAPSIE",
-                niveau,
-                None
             )
 
-            await afficher_recapitulatif_inscription(
-                interaction,
-                profile_key
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # B1 Ingénierie n'a pas encore de spécialisation.
-        # ----------------------------------------------------
-
-        if (
-            self.cursus == "Ingénierie"
-            and niveau == "B1"
+        except (
+            json.JSONDecodeError,
+            TypeError
         ):
 
-            profile_key = trouver_profile_key(
-                "Ingénierie",
-                "B1",
-                None
-            )
+            pass
 
-            await afficher_recapitulatif_inscription(
-                interaction,
-                profile_key
-            )
+    # --------------------------------------------------------
+    # Ancienne demande basée sur un profil.
+    # --------------------------------------------------------
 
-            return
+    profile_key = (
+        demande["requested_profile_key"]
+        if "requested_profile_key" in colonnes
+        else None
+    )
 
-        # ----------------------------------------------------
-        # Les autres niveaux nécessitent une orientation.
-        # ----------------------------------------------------
-
-        await interaction.response.edit_message(
-            content=(
-                "🎓 **INSCRIPTION ACADÉMIQUE**\n\n"
-                f"Cursus : **{self.cursus}**\n"
-                f"Niveau : **{niveau}**\n\n"
-                "Sélectionnez votre orientation :"
-            ),
-
-            view=OrientationView(
-                self.cursus,
-                niveau
-            )
+    return normaliser_roles_academiques(
+        PROFILS_ACADEMIQUES_LEGACY.get(
+            profile_key,
+            []
         )
+    )
 
 
-class NiveauView(
-    discord.ui.View
-):
+def roles_finaux_depuis_demande(
+    demande
+) -> list[str]:
 
-    def __init__(
-        self,
-        cursus: str
+    if not demande:
+
+        return []
+
+    colonnes = set(
+        demande.keys()
+    )
+
+    if (
+        "final_roles_json" in colonnes
+        and demande["final_roles_json"]
     ):
 
-        super().__init__(
-            timeout=300
-        )
+        try:
 
-        self.add_item(
-            NiveauSelect(
-                cursus
-            )
-        )
-
-
-# ============================================================
-# 6.5 CHOIX DE L'ORIENTATION
-# ============================================================
-
-class OrientationSelect(
-    discord.ui.Select
-):
-
-    def __init__(
-        self,
-        cursus: str,
-        niveau: str
-    ):
-
-        self.cursus = cursus
-        self.niveau = niveau
-
-        if niveau in {
-            "B2",
-            "B3 & BC"
-        }:
-
-            orientations = [
-                "Chimie",
-                "Physique",
-                "Mécanique",
-                "Électricité - Électronique - Informatique",
-            ]
-
-        else:
-
-            orientations = [
-                "Chimie",
-                "Physique",
-                "Mécanique",
-                "Électricité",
-                "Électronique",
-                "Informatique",
-            ]
-
-        super().__init__(
-            placeholder="Sélectionnez votre orientation",
-            min_values=1,
-            max_values=1,
-
-            options=[
-                discord.SelectOption(
-                    label=orientation,
-                    value=orientation
+            return normaliser_roles_academiques(
+                json.loads(
+                    demande["final_roles_json"]
                 )
+            )
 
-                for orientation in orientations
-            ]
+        except (
+            json.JSONDecodeError,
+            TypeError
+        ):
+
+            pass
+
+    # --------------------------------------------------------
+    # Compatibilité avec l'ancien système.
+    # --------------------------------------------------------
+
+    if (
+        "final_profile_key" in colonnes
+        and demande["final_profile_key"]
+    ):
+
+        return normaliser_roles_academiques(
+            PROFILS_ACADEMIQUES_LEGACY.get(
+                demande["final_profile_key"],
+                []
+            )
+        )
+
+    if demande["status"] in {
+        "approved",
+        "corrected"
+    }:
+
+        return roles_demandes_depuis_demande(
+            demande
+        )
+
+    return []
+
+
+# ============================================================
+# 6.3 INTERFACE PAGINÉE PAR BOUTONS COCHABLES
+# ============================================================
+#
+# Discord ne propose pas de vraie grille de cases à cocher.
+# On simule donc ce fonctionnement avec des boutons :
+#
+#     ✅ bouton vert  = rôle sélectionné
+#     ⬜ bouton gris  = rôle non sélectionné
+#
+# Les rôles sont répartis sur 6 onglets :
+#
+#     1. BAPSIE
+#     2. B1 ING
+#     3. B2 ING
+#     4. B3 & BC ING
+#     5. M1 ING
+#     6. M2 ING
+#
+# Les choix restent mémorisés lorsqu'on change de page.
+# ============================================================
+
+
+class EtatSelectionRoles:
+
+    def __init__(
+        self,
+        roles_selectionnes=None,
+        roles_actuels=None
+    ):
+
+        selection_normalisee = (
+            normaliser_roles_academiques(
+                roles_selectionnes or []
+            )
+        )
+
+        actuels_normalises = (
+            normaliser_roles_academiques(
+                roles_actuels
+                if roles_actuels is not None
+                else selection_normalisee
+            )
+        )
+
+        # Liste que l'utilisateur est en train de préparer.
+        self.roles = set(
+            selection_normalisee
+        )
+
+        # État initial de la sélection.
+        # Le bouton RÉINITIALISER revient exactement ici.
+        self.roles_depart = set(
+            selection_normalisee
+        )
+
+        # Situation académique réellement détenue au moment
+        # où l'interface est ouverte.
+        self.roles_actuels = set(
+            actuels_normalises
+        )
+
+
+def formater_roles_compact(
+    roles,
+    vide="Aucun"
+) -> str:
+
+    roles_ordonnes = (
+        normaliser_roles_academiques(
+            roles
+        )
+    )
+
+    if not roles_ordonnes:
+
+        return vide
+
+    return " • ".join(
+        f"`{role}`"
+        for role in roles_ordonnes
+    )
+
+
+def trouver_page_selection(
+    roles_selectionnes
+) -> int:
+
+    roles_selectionnes = set(
+        normaliser_roles_academiques(
+            roles_selectionnes
+        )
+    )
+
+    # Ouvre automatiquement l'onglet contenant le plus
+    # de rôles déjà sélectionnés.
+    meilleur_index = 0
+    meilleur_score = 0
+
+    for index, groupe in enumerate(
+        GROUPES_ROLES_ACADEMIQUES
+    ):
+
+        score = sum(
+            1
+            for nom_role in groupe["roles"]
+            if nom_role in roles_selectionnes
+        )
+
+        if score > meilleur_score:
+
+            meilleur_index = index
+            meilleur_score = score
+
+    return meilleur_index
+
+
+def titre_mode_selection(
+    mode: str
+) -> str:
+
+    if mode == "student":
+
+        return (
+            "🎓 **SÉLECTION DE VOS RÔLES ACADÉMIQUES**"
+        )
+
+    return (
+        "✏️ **MODIFICATION DE LA DEMANDE PAR LE CE ISIB**"
+    )
+
+
+def texte_interface_selection(
+    etat: EtatSelectionRoles,
+    titre: str,
+    page_index=None
+) -> str:
+
+    if page_index is None:
+
+        page_index = trouver_page_selection(
+            etat.roles
+        )
+
+    page_index = max(
+        0,
+        min(
+            page_index,
+            len(GROUPES_ROLES_ACADEMIQUES) - 1
+        )
+    )
+
+    groupe = GROUPES_ROLES_ACADEMIQUES[
+        page_index
+    ]
+
+    nombre_page = sum(
+        1
+        for nom_role in groupe["roles"]
+        if nom_role in etat.roles
+    )
+
+    roles_actuels = formater_roles_compact(
+        etat.roles_actuels,
+        vide="Aucun rôle académique"
+    )
+
+    roles_demandes = formater_roles_compact(
+        etat.roles,
+        vide="Aucun rôle sélectionné"
+    )
+
+    return (
+        f"{titre}\n\n"
+
+        f"📄 **Page {page_index + 1}/"
+        f"{len(GROUPES_ROLES_ACADEMIQUES)} — "
+        f"{groupe['label']}**\n"
+
+        f"**{nombre_page} rôle(s) sélectionné(s) "
+        "sur cet onglet**\n\n"
+
+        "📌 **Rôles actuels :**\n"
+        f"{roles_actuels}\n\n"
+
+        "📝 **Rôles demandés :**\n"
+        f"{roles_demandes}\n\n"
+
+        "Cliquez sur un rôle pour le cocher ou le décocher.\n"
+        "✅ **vert = sélectionné**   "
+        "⬜ **gris = non sélectionné**\n\n"
+
+        "Vous pouvez changer d'onglet sans perdre vos choix. "
+        "Un rôle actuel non sélectionné dans la demande "
+        "sera retiré uniquement si le CE valide la demande."
+    )
+
+
+def utilisateur_autorise_interface_ce(
+    interaction: discord.Interaction
+) -> bool:
+
+    return (
+        isinstance(
+            interaction.user,
+            discord.Member
+        )
+        and utilisateur_peut_valider_inscription(
+            interaction.user
+        )
+    )
+
+
+def libelle_role_bouton(
+    groupe: dict,
+    nom_role: str
+) -> str:
+
+    if (
+        groupe.get("general_role")
+        and nom_role == groupe["general_role"]
+    ):
+
+        return (
+            f"GÉNÉRAL · {nom_role}"
+        )[:80]
+
+    if groupe.get("general_role"):
+
+        return (
+            f"OPTION · {nom_role}"
+        )[:80]
+
+    return nom_role[:80]
+
+
+class RoleToggleButton(
+    discord.ui.Button
+):
+
+    def __init__(
+        self,
+        etat: EtatSelectionRoles,
+        groupe: dict,
+        nom_role: str,
+        mode: str,
+        page_index: int,
+        request_id=None,
+        row=0
+    ):
+
+        self.etat = etat
+        self.groupe = groupe
+        self.nom_role = nom_role
+        self.mode = mode
+        self.page_index = page_index
+        self.request_id = request_id
+
+        selectionne = (
+            nom_role in etat.roles
+        )
+
+        super().__init__(
+            label=libelle_role_bouton(
+                groupe,
+                nom_role
+            ),
+            emoji=(
+                "✅"
+                if selectionne
+                else "⬜"
+            ),
+            style=(
+                discord.ButtonStyle.success
+                if selectionne
+                else discord.ButtonStyle.secondary
+            ),
+            row=row
         )
 
     async def callback(
@@ -2279,144 +2515,593 @@ class OrientationSelect(
         interaction: discord.Interaction
     ):
 
-        orientation = self.values[0]
-
-        profile_key = trouver_profile_key(
-            self.cursus,
-            self.niveau,
-            orientation
-        )
-
-        if not profile_key:
+        if (
+            self.mode == "ce"
+            and not utilisateur_autorise_interface_ce(
+                interaction
+            )
+        ):
 
             await interaction.response.send_message(
-                "❌ Profil académique introuvable.",
+                "❌ Permission insuffisante.",
                 ephemeral=True
             )
 
             return
 
-        await afficher_recapitulatif_inscription(
-            interaction,
-            profile_key
+        if self.nom_role in self.etat.roles:
+
+            self.etat.roles.discard(
+                self.nom_role
+            )
+
+        else:
+
+            self.etat.roles.add(
+                self.nom_role
+            )
+
+        await interaction.response.edit_message(
+            content=texte_interface_selection(
+                self.etat,
+                titre_mode_selection(
+                    self.mode
+                ),
+                self.page_index
+            ),
+            view=SelectionRolesView(
+                etat=self.etat,
+                mode=self.mode,
+                request_id=self.request_id,
+                page_index=self.page_index
+            )
         )
 
 
-class OrientationView(
+class PageRolesButton(
+    discord.ui.Button
+):
+
+    def __init__(
+        self,
+        etat: EtatSelectionRoles,
+        mode: str,
+        page_cible: int,
+        page_actuelle: int,
+        request_id=None,
+        row=2
+    ):
+
+        self.etat = etat
+        self.mode = mode
+        self.page_cible = page_cible
+        self.request_id = request_id
+
+        est_page_actuelle = (
+            page_cible == page_actuelle
+        )
+
+        groupe = GROUPES_ROLES_ACADEMIQUES[
+            page_cible
+        ]
+
+        super().__init__(
+            label=groupe["tab_label"][:80],
+            style=(
+                discord.ButtonStyle.primary
+                if est_page_actuelle
+                else discord.ButtonStyle.secondary
+            ),
+            disabled=est_page_actuelle,
+            row=row
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if (
+            self.mode == "ce"
+            and not utilisateur_autorise_interface_ce(
+                interaction
+            )
+        ):
+
+            await interaction.response.send_message(
+                "❌ Permission insuffisante.",
+                ephemeral=True
+            )
+
+            return
+
+        await interaction.response.edit_message(
+            content=texte_interface_selection(
+                self.etat,
+                titre_mode_selection(
+                    self.mode
+                ),
+                self.page_cible
+            ),
+            view=SelectionRolesView(
+                etat=self.etat,
+                mode=self.mode,
+                request_id=self.request_id,
+                page_index=self.page_cible
+            )
+        )
+
+
+class SelectionRolesView(
     discord.ui.View
 ):
 
     def __init__(
         self,
-        cursus: str,
-        niveau: str
+        etat: EtatSelectionRoles,
+        mode: str,
+        request_id=None,
+        page_index=None
     ):
 
         super().__init__(
-            timeout=300
+            timeout=600
         )
 
-        self.add_item(
-            OrientationSelect(
-                cursus,
-                niveau
+        self.etat = etat
+        self.mode = mode
+        self.request_id = request_id
+
+        if page_index is None:
+
+            page_index = trouver_page_selection(
+                self.etat.roles
+            )
+
+        self.page_index = max(
+            0,
+            min(
+                page_index,
+                len(GROUPES_ROLES_ACADEMIQUES) - 1
             )
         )
 
+        groupe = GROUPES_ROLES_ACADEMIQUES[
+            self.page_index
+        ]
+
+        # ----------------------------------------------------
+        # LIGNES 0 ET 1 : RÔLES DE L'ONGLET
+        # ----------------------------------------------------
+
+        for index, nom_role in enumerate(
+            groupe["roles"]
+        ):
+
+            self.add_item(
+                RoleToggleButton(
+                    etat=self.etat,
+                    groupe=groupe,
+                    nom_role=nom_role,
+                    mode=self.mode,
+                    request_id=self.request_id,
+                    page_index=self.page_index,
+                    row=index // 5
+                )
+            )
+
+        # ----------------------------------------------------
+        # LIGNES 2 ET 3 : ONGLETS
+        #
+        # Discord affiche au maximum 5 boutons par ligne.
+        # Les 5 premiers onglets sont donc sur la ligne 2,
+        # le 6e sur la ligne 3.
+        #
+        # L'onglet actif est bleu et désactivé.
+        # Les autres sont gris et cliquables.
+        # ----------------------------------------------------
+
+        for page_cible in range(
+            len(GROUPES_ROLES_ACADEMIQUES)
+        ):
+
+            ligne = (
+                2
+                if page_cible < 5
+                else 3
+            )
+
+            self.add_item(
+                PageRolesButton(
+                    etat=self.etat,
+                    mode=self.mode,
+                    page_cible=page_cible,
+                    page_actuelle=self.page_index,
+                    request_id=self.request_id,
+                    row=ligne
+                )
+            )
+
+        # ----------------------------------------------------
+        # LIGNE 4 : ACTIONS
+        # ----------------------------------------------------
+
+        bouton_vider_page = discord.ui.Button(
+            label="EFFACER CET ONGLET",
+            emoji="🧹",
+            style=discord.ButtonStyle.danger,
+            row=4
+        )
+
+        bouton_vider_page.callback = (
+            self.vider_page
+        )
+
+        bouton_reinitialiser = discord.ui.Button(
+            label="RÉINITIALISER",
+            emoji="↩️",
+            style=discord.ButtonStyle.secondary,
+            row=4
+        )
+
+        bouton_reinitialiser.callback = (
+            self.reinitialiser
+        )
+
+        self.add_item(
+            bouton_vider_page
+        )
+
+        self.add_item(
+            bouton_reinitialiser
+        )
+
+        if self.mode == "student":
+
+            bouton_continuer = discord.ui.Button(
+                label="RÉCAPITULATIF",
+                emoji="📋",
+                style=discord.ButtonStyle.primary,
+                row=4
+            )
+
+            bouton_continuer.callback = (
+                self.recapitulatif_etudiant
+            )
+
+            bouton_annuler = discord.ui.Button(
+                label="ANNULER",
+                emoji="❌",
+                style=discord.ButtonStyle.secondary,
+                row=4
+            )
+
+            bouton_annuler.callback = (
+                self.annuler_etudiant
+            )
+
+            self.add_item(
+                bouton_continuer
+            )
+
+            self.add_item(
+                bouton_annuler
+            )
+
+        else:
+
+            bouton_appliquer = discord.ui.Button(
+                label="VALIDER MODIF.",
+                emoji="✅",
+                style=discord.ButtonStyle.success,
+                row=4
+            )
+
+            bouton_appliquer.callback = (
+                self.valider_modification_ce
+            )
+
+            bouton_annuler = discord.ui.Button(
+                label="ANNULER",
+                emoji="❌",
+                style=discord.ButtonStyle.secondary,
+                row=4
+            )
+
+            bouton_annuler.callback = (
+                self.annuler_modification_ce
+            )
+
+            self.add_item(
+                bouton_appliquer
+            )
+
+            self.add_item(
+                bouton_annuler
+            )
+
+    async def vider_page(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if (
+            self.mode == "ce"
+            and not utilisateur_autorise_interface_ce(
+                interaction
+            )
+        ):
+
+            await interaction.response.send_message(
+                "❌ Permission insuffisante.",
+                ephemeral=True
+            )
+
+            return
+
+        groupe = GROUPES_ROLES_ACADEMIQUES[
+            self.page_index
+        ]
+
+        for nom_role in groupe["roles"]:
+
+            self.etat.roles.discard(
+                nom_role
+            )
+
+        await interaction.response.edit_message(
+            content=texte_interface_selection(
+                self.etat,
+                titre_mode_selection(
+                    self.mode
+                ),
+                self.page_index
+            ),
+            view=SelectionRolesView(
+                etat=self.etat,
+                mode=self.mode,
+                request_id=self.request_id,
+                page_index=self.page_index
+            )
+        )
+
+    async def reinitialiser(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if (
+            self.mode == "ce"
+            and not utilisateur_autorise_interface_ce(
+                interaction
+            )
+        ):
+
+            await interaction.response.send_message(
+                "❌ Permission insuffisante.",
+                ephemeral=True
+            )
+
+            return
+
+        self.etat.roles = set(
+            self.etat.roles_depart
+        )
+
+        nouvelle_page = trouver_page_selection(
+            self.etat.roles
+        )
+
+        await interaction.response.edit_message(
+            content=texte_interface_selection(
+                self.etat,
+                titre_mode_selection(
+                    self.mode
+                ),
+                nouvelle_page
+            ),
+            view=SelectionRolesView(
+                etat=self.etat,
+                mode=self.mode,
+                request_id=self.request_id,
+                page_index=nouvelle_page
+            )
+        )
+
+    async def recapitulatif_etudiant(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        roles_demandes = normaliser_roles_academiques(
+            self.etat.roles
+        )
+
+        if not roles_demandes:
+
+            await interaction.response.send_message(
+                "❌ **AUCUN RÔLE SÉLECTIONNÉ**\n\n"
+                "Sélectionnez au moins un rôle académique "
+                "avant de continuer.",
+                ephemeral=True
+            )
+
+            return
+
+        await afficher_recapitulatif_roles(
+            interaction,
+            roles_demandes
+        )
+
+    async def annuler_etudiant(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        await interaction.response.edit_message(
+            content=(
+                "❌ **INSCRIPTION ANNULÉE**\n\n"
+                "Aucune demande n'a été envoyée."
+            ),
+            view=None
+        )
+
+    async def valider_modification_ce(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if not utilisateur_autorise_interface_ce(
+            interaction
+        ):
+
+            await interaction.response.send_message(
+                "❌ Permission insuffisante.",
+                ephemeral=True
+            )
+
+            return
+
+        roles_finaux = normaliser_roles_academiques(
+            self.etat.roles
+        )
+
+        if not roles_finaux:
+
+            await interaction.response.send_message(
+                "❌ Sélectionnez au moins un rôle académique.",
+                ephemeral=True
+            )
+
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True
+        )
+
+        await traiter_validation_roles(
+            interaction=interaction,
+            request_id=self.request_id,
+            roles_finaux=roles_finaux,
+            correction=True
+        )
+
+    async def annuler_modification_ce(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        await interaction.response.edit_message(
+            content=(
+                "↩️ Modification annulée.\n\n"
+                "La demande CE originale reste en attente."
+            ),
+            view=None
+        )
+
 
 # ============================================================
-# 6.6 RÉCAPITULATIF
+# 6.4 RÉCAPITULATIF ÉTUDIANT
 # ============================================================
 
-async def afficher_recapitulatif_inscription(
+async def afficher_recapitulatif_roles(
     interaction: discord.Interaction,
-    profile_key: str
+    roles_demandes: list[str]
 ):
 
-    profil = PROFILS_ACADEMIQUES[
-        profile_key
-    ]
-
-    roles_actuels = []
-
-    if isinstance(
+    if not isinstance(
         interaction.user,
         discord.Member
     ):
 
-        roles_actuels = (
-            lire_roles_academiques_membre(
-                interaction.user
-            )
+        await interaction.response.send_message(
+            "❌ Impossible d'identifier votre compte.",
+            ephemeral=True
         )
 
-    roles_demandes = profil[
-        "roles"
-    ]
+        return
 
-    texte_actuel = (
-        "\n".join(
-            f"• `{role}`"
-            for role in roles_actuels
+    roles_actuels = (
+        lire_roles_academiques_membre(
+            interaction.user
+        )
+    )
+
+    a_retirer, a_ajouter, conserves = (
+        calculer_modifications_roles(
+            roles_actuels,
+            roles_demandes
+        )
+    )
+
+    texte_modifications = []
+
+    for role in a_retirer:
+
+        texte_modifications.append(
+            f"➖ `{role}`"
         )
 
-        if roles_actuels
+    for role in a_ajouter:
 
-        else "• Aucun rôle académique actuellement attribué"
-    )
+        texte_modifications.append(
+            f"➕ `{role}`"
+        )
 
-    texte_demande = "\n".join(
-        f"• `{role}`"
-        for role in roles_demandes
-    )
+    for role in conserves:
 
-    orientation = (
-        profil["option"]
-        if profil["option"]
-        else "Aucune"
-    )
+        texte_modifications.append(
+            f"➡️ `{role}` conservé"
+        )
+
+    if not texte_modifications:
+
+        texte_modifications.append(
+            "➡️ Aucun changement"
+        )
 
     contenu = (
         "🎓 **RÉCAPITULATIF DE VOTRE DEMANDE**\n\n"
 
-        "**Situation académique actuelle :**\n"
-        f"{texte_actuel}\n\n"
+        "📌 **Rôles académiques actuels :**\n"
+        f"{formater_roles(roles_actuels)}\n\n"
 
-        "**Nouvelle demande :**\n"
-        f"**Cursus :** {profil['cursus']}\n"
-        f"**Niveau :** {profil['niveau']}\n"
-        f"**Orientation :** {orientation}\n\n"
+        "🎓 **Rôles académiques demandés :**\n"
+        f"{formater_roles(roles_demandes)}\n\n"
 
-        "**Rôles demandés :**\n"
-        f"{texte_demande}\n\n"
+        "🔄 **Effet si le CE valide exactement cette demande :**\n"
+        f"{chr(10).join(texte_modifications)}\n\n"
 
-        "Vérifiez attentivement vos choix avant "
-        "de transmettre votre demande."
+        "Vérifiez attentivement la liste avant l'envoi."
     )
 
     await interaction.response.edit_message(
         content=contenu,
-
-        view=RecapitulatifInscriptionView(
-            profile_key
+        view=RecapitulatifRolesView(
+            roles_demandes
         )
     )
 
 
-class RecapitulatifInscriptionView(
+class RecapitulatifRolesView(
     discord.ui.View
 ):
 
     def __init__(
         self,
-        profile_key: str
+        roles_demandes: list[str]
     ):
 
         super().__init__(
-            timeout=300
+            timeout=600
         )
 
-        self.profile_key = profile_key
+        self.roles_demandes = (
+            normaliser_roles_academiques(
+                roles_demandes
+            )
+        )
 
     @discord.ui.button(
         label="ENVOYER MA DEMANDE",
@@ -2431,37 +3116,55 @@ class RecapitulatifInscriptionView(
 
         await envoyer_demande_academique(
             interaction,
-            self.profile_key
+            self.roles_demandes
         )
 
     @discord.ui.button(
-        label="RECOMMENCER",
-        emoji="🔄",
+        label="MODIFIER MA SÉLECTION",
+        emoji="✏️",
         style=discord.ButtonStyle.secondary
     )
-    async def recommencer(
+    async def modifier(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button
     ):
 
-        await interaction.response.edit_message(
-            content=(
-                "🎓 **INSCRIPTION ACADÉMIQUE**\n\n"
-                "Sélectionnez votre cursus :"
-            ),
+        roles_actuels = (
+            lire_roles_academiques_membre(
+                interaction.user
+            )
+            if isinstance(
+                interaction.user,
+                discord.Member
+            )
+            else []
+        )
 
-            view=CursusView()
+        etat = EtatSelectionRoles(
+            roles_selectionnes=self.roles_demandes,
+            roles_actuels=roles_actuels
+        )
+
+        await interaction.response.edit_message(
+            content=texte_interface_selection(
+                etat,
+                "🎓 **SÉLECTION DE VOS RÔLES ACADÉMIQUES**"
+            ),
+            view=SelectionRolesView(
+                etat=etat,
+                mode="student"
+            )
         )
 
 
 # ============================================================
-# 6.7 CRÉATION DE LA DEMANDE
+# 6.5 CRÉATION SÉCURISÉE DE LA DEMANDE
 # ============================================================
 
 async def envoyer_demande_academique(
     interaction: discord.Interaction,
-    profile_key: str
+    roles_demandes: list[str]
 ):
 
     if not (
@@ -2480,7 +3183,7 @@ async def envoyer_demande_academique(
         return
 
     # --------------------------------------------------------
-    # Il faut avoir terminé l'authentification mail.
+    # Authentification obligatoire.
     # --------------------------------------------------------
 
     role_verifie = trouver_role_etudiant_verifie(
@@ -2520,9 +3223,6 @@ async def envoyer_demande_academique(
 
     # --------------------------------------------------------
     # Une seule demande EN ATTENTE à la fois.
-    #
-    # Une ancienne demande validée/corrigée/refusée
-    # n'empêche absolument pas une nouvelle demande.
     # --------------------------------------------------------
 
     demande_attente = (
@@ -2544,10 +3244,100 @@ async def envoyer_demande_academique(
 
         return
 
+    roles_demandes = normaliser_roles_academiques(
+        roles_demandes
+    )
+
+    if not roles_demandes:
+
+        await interaction.response.send_message(
+            "❌ Sélectionnez au moins un rôle académique.",
+            ephemeral=True
+        )
+
+        return
+
     # --------------------------------------------------------
-    # Lecture EXACTE des rôles académiques présents
-    # au moment de la demande.
+    # Vérification du salon CE AVANT d'enregistrer la demande.
     # --------------------------------------------------------
+
+    salon_validation = (
+        await recuperer_salon_validation(
+            interaction.client
+        )
+    )
+
+    if not isinstance(
+        salon_validation,
+        discord.TextChannel
+    ):
+
+        await interaction.response.send_message(
+            "❌ **DEMANDE NON ENVOYÉE**\n\n"
+            "Le salon interne de validation "
+            "est actuellement indisponible.\n\n"
+            "Aucune demande n'a été enregistrée.",
+            ephemeral=True
+        )
+
+        return
+
+    membre_bot = interaction.guild.me
+
+    if membre_bot is None:
+
+        await interaction.response.send_message(
+            "❌ **DEMANDE NON ENVOYÉE**\n\n"
+            "Impossible de vérifier les permissions "
+            "du Bot ISIB.",
+            ephemeral=True
+        )
+
+        return
+
+    permissions = salon_validation.permissions_for(
+        membre_bot
+    )
+
+    permissions_manquantes = []
+
+    if not permissions.view_channel:
+
+        permissions_manquantes.append(
+            "Voir le salon"
+        )
+
+    if not permissions.send_messages:
+
+        permissions_manquantes.append(
+            "Envoyer des messages"
+        )
+
+    if not permissions.embed_links:
+
+        permissions_manquantes.append(
+            "Intégrer des liens"
+        )
+
+    if permissions_manquantes:
+
+        print(
+            "❌ Permissions manquantes dans "
+            "#validation-inscriptions : "
+            + ", ".join(
+                permissions_manquantes
+            )
+        )
+
+        await interaction.response.send_message(
+            "❌ **DEMANDE NON ENVOYÉE**\n\n"
+            "Le système interne de validation "
+            "est momentanément indisponible.\n\n"
+            "Aucune demande n'a été enregistrée.",
+            ephemeral=True
+        )
+
+        return
 
     roles_actuels = (
         lire_roles_academiques_membre(
@@ -2566,27 +3356,8 @@ async def envoyer_demande_academique(
         prenom=identite["prenom"],
         email=identite["email"],
         roles_actuels=roles_actuels,
-        profile_key=profile_key
+        roles_demandes=roles_demandes
     )
-
-    salon_validation = (
-        await recuperer_salon_validation(
-            interaction.client
-        )
-    )
-
-    if not isinstance(
-        salon_validation,
-        discord.TextChannel
-    ):
-
-        await interaction.followup.send(
-            "❌ Le salon interne de validation "
-            "est introuvable.",
-            ephemeral=True
-        )
-
-        return
 
     demande = recuperer_demande(
         request_id
@@ -2596,13 +3367,59 @@ async def envoyer_demande_academique(
         demande
     )
 
-    message = await salon_validation.send(
-        embed=embed,
+    try:
 
-        view=ValidationInscriptionView(
+        message = await salon_validation.send(
+            embed=embed,
+            view=ValidationInscriptionView(
+                request_id
+            )
+        )
+
+    except discord.Forbidden as erreur:
+
+        supprimer_demande_academique(
             request_id
         )
-    )
+
+        print(
+            "❌ Impossible d'envoyer la demande "
+            "dans #validation-inscriptions :",
+            erreur
+        )
+
+        await interaction.followup.send(
+            "❌ **DEMANDE NON ENVOYÉE**\n\n"
+            "Le bot ne possède pas les permissions "
+            "nécessaires dans le salon interne.\n\n"
+            "La demande n'a pas été conservée et "
+            "vous pourrez réessayer.",
+            ephemeral=True
+        )
+
+        return
+
+    except discord.HTTPException as erreur:
+
+        supprimer_demande_academique(
+            request_id
+        )
+
+        print(
+            "❌ Erreur Discord pendant "
+            "l'envoi de la demande :",
+            erreur
+        )
+
+        await interaction.followup.send(
+            "❌ **DEMANDE NON ENVOYÉE**\n\n"
+            "Discord a rencontré une erreur.\n\n"
+            "La demande n'a pas été conservée "
+            "et vous pouvez réessayer.",
+            ephemeral=True
+        )
+
+        return
 
     enregistrer_message_validation(
         request_id=request_id,
@@ -2612,12 +3429,12 @@ async def envoyer_demande_academique(
 
     await interaction.followup.send(
         "📩 **DEMANDE ENVOYÉE**\n\n"
-        "Votre demande d'inscription académique "
-        "a bien été transmise.\n\n"
-        "Elle est maintenant **en attente de validation** "
-        "par les équipes internes du Discord Étudiant ISIB.\n\n"
-        "Vos rôles actuels restent inchangés "
-        "jusqu'à la validation.",
+        "Votre demande d'accès académique a bien "
+        "été transmise au CE ISIB.\n\n"
+        "Vos rôles ne changent pas tant que la "
+        "demande n'est pas traitée.\n\n"
+        "Vous recevrez un **message privé du Bot ISIB** "
+        "après validation, modification ou refus.",
         ephemeral=True
     )
 
@@ -2632,9 +3449,13 @@ async def envoyer_demande_academique(
                 interaction.channel
             )
 
-        except discord.HTTPException:
+        except discord.HTTPException as erreur:
 
-            pass
+            print(
+                "⚠️ Impossible de replacer "
+                "le panneau d'inscription :",
+                erreur
+            )
 
 
 # ============================================================
@@ -2650,17 +3471,17 @@ def construire_embed_validation(
     demande
 ) -> discord.Embed:
 
-    profil_demande = PROFILS_ACADEMIQUES[
-        demande["requested_profile_key"]
-    ]
-
-    roles_actuels = json.loads(
-        demande["current_roles_json"]
+    roles_actuels = normaliser_roles_academiques(
+        json.loads(
+            demande["current_roles_json"]
+        )
     )
 
-    roles_demandes = profil_demande[
-        "roles"
-    ]
+    roles_demandes = (
+        roles_demandes_depuis_demande(
+            demande
+        )
+    )
 
     a_retirer, a_ajouter, conserves = (
         calculer_modifications_roles(
@@ -2671,9 +3492,8 @@ def construire_embed_validation(
 
     embed = discord.Embed(
         title=(
-            "🎓 DEMANDE D'INSCRIPTION ACADÉMIQUE"
+            "🎓 DEMANDE D'ACCÈS ACADÉMIQUES"
         ),
-
         timestamp=datetime.fromtimestamp(
             demande["created_at"],
             timezone.utc
@@ -2694,82 +3514,49 @@ def construire_embed_validation(
         inline=False
     )
 
-    texte_actuel = (
-        "\n".join(
-            f"• `{role}`"
-            for role in roles_actuels
-        )
-
-        if roles_actuels
-
-        else "• Aucun rôle académique actuellement attribué"
-    )
-
     embed.add_field(
-        name="📌 Situation actuelle au moment de la demande",
-        value=texte_actuel,
-        inline=False
-    )
-
-    embed.add_field(
-        name="🎓 Nouvelle demande",
-        value=(
-            f"**Cursus :** "
-            f"{profil_demande['cursus']}\n"
-
-            f"**Niveau :** "
-            f"{profil_demande['niveau']}\n"
-
-            f"**Orientation :** "
-            f"{profil_demande['option'] or 'Aucune'}"
+        name="📌 Situation au moment de la demande",
+        value=formater_roles(
+            roles_actuels
         ),
         inline=False
     )
 
-    texte_roles_demandes = "\n".join(
-        f"• `{role}`"
-        for role in roles_demandes
-    )
-
     embed.add_field(
-        name="Rôles demandés",
-        value=texte_roles_demandes,
-        inline=False
-    )
-
-    modifications = []
-
-    for role in a_retirer:
-
-        modifications.append(
-            f"➖ `{role}`"
-        )
-
-    for role in a_ajouter:
-
-        modifications.append(
-            f"➕ `{role}`"
-        )
-
-    for role in conserves:
-
-        modifications.append(
-            f"➡️ `{role}` conservé"
-        )
-
-    if not modifications:
-
-        modifications.append(
-            "➡️ Aucun changement de rôle"
-        )
-
-    embed.add_field(
-        name="🔄 Modifications prévues",
-        value="\n".join(
-            modifications
+        name="🎓 Rôles demandés",
+        value=formater_roles(
+            roles_demandes
         ),
         inline=False
     )
+
+    embed.add_field(
+        name="➖ Rôles à retirer si validation",
+        value=formater_roles(
+            a_retirer,
+            vide="• Aucun"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="➕ Rôles à ajouter si validation",
+        value=formater_roles(
+            a_ajouter,
+            vide="• Aucun"
+        ),
+        inline=False
+    )
+
+    if conserves:
+
+        embed.add_field(
+            name="➡️ Rôles académiques conservés",
+            value=formater_roles(
+                conserves
+            ),
+            inline=False
+        )
 
     statut = demande["status"]
 
@@ -2784,7 +3571,7 @@ def construire_embed_validation(
     elif statut == "corrected":
 
         texte_statut = (
-            "✏️ CORRIGÉE ET VALIDÉE"
+            "✏️ MODIFIÉE ET VALIDÉE"
         )
 
     elif statut == "refused":
@@ -2801,29 +3588,21 @@ def construire_embed_validation(
         inline=False
     )
 
-    if demande["final_profile_key"]:
+    if statut in {
+        "approved",
+        "corrected"
+    }:
 
-        final_key = demande[
-            "final_profile_key"
-        ]
-
-        final = PROFILS_ACADEMIQUES[
-            final_key
-        ]
-
-        embed.add_field(
-            name="✅ Profil finalement validé",
-            value=description_profil(
-                final_key
-            ),
-            inline=False
+        roles_finaux = (
+            roles_finaux_depuis_demande(
+                demande
+            )
         )
 
         embed.add_field(
-            name="Rôles finalement attribués",
-            value="\n".join(
-                f"• `{role}`"
-                for role in final["roles"]
+            name="✅ Rôles finalement attribués",
+            value=formater_roles(
+                roles_finaux
             ),
             inline=False
         )
@@ -2906,7 +3685,6 @@ async def mettre_a_jour_message_validation(
             embed=construire_embed_validation(
                 demande
             ),
-
             view=None
         )
 
@@ -2919,32 +3697,39 @@ async def mettre_a_jour_message_validation(
 
 
 # ============================================================
-# 7.2 APPLICATION D'UN PROFIL
+# 7.2 APPLICATION EXACTE DES RÔLES
 # ============================================================
 
-async def appliquer_profil_academique(
+async def appliquer_roles_academiques(
     member: discord.Member,
-    profile_key: str
+    roles_finaux: list[str]
 ):
 
-    profil = PROFILS_ACADEMIQUES[
-        profile_key
-    ]
+    roles_finaux = normaliser_roles_academiques(
+        roles_finaux
+    )
 
-    guild = member.guild
-
-    noms_roles_academiques = (
+    noms_autorises = set(
         obtenir_tous_noms_roles_academiques()
     )
 
-    # --------------------------------------------------------
-    # Recherche des rôles qui doivent être attribués.
-    # --------------------------------------------------------
+    if not set(
+        roles_finaux
+    ).issubset(
+        noms_autorises
+    ):
+
+        return (
+            False,
+            "La demande contient un rôle académique non autorisé."
+        )
+
+    guild = member.guild
 
     roles_voulus = []
     roles_introuvables = []
 
-    for nom_role in profil["roles"]:
+    for nom_role in roles_finaux:
 
         role = discord.utils.get(
             guild.roles,
@@ -2968,32 +3753,18 @@ async def appliquer_profil_academique(
         return (
             False,
             (
-                "Rôles introuvables : "
+                "Rôles Discord introuvables : "
                 + ", ".join(
                     roles_introuvables
                 )
             )
         )
 
-    # --------------------------------------------------------
-    # IMPORTANT :
-    #
-    # on regarde ici la situation RÉELLE AU MOMENT
-    # DE LA VALIDATION.
-    #
-    # On retire seulement les rôles académiques gérés
-    # par ce système.
-    #
-    # Le rôle vérifié, les rôles CE, administration,
-    # communication, etc. ne sont jamais touchés.
-    # --------------------------------------------------------
-
     roles_a_retirer = [
         role
         for role in member.roles
-
         if (
-            role.name in noms_roles_academiques
+            role.name in noms_autorises
             and role not in roles_voulus
         )
     ]
@@ -3001,9 +3772,89 @@ async def appliquer_profil_academique(
     roles_a_ajouter = [
         role
         for role in roles_voulus
-
         if role not in member.roles
     ]
+
+    # --------------------------------------------------------
+    # Vérification de la hiérarchie AVANT toute modification.
+    # Cela réduit fortement le risque de modification partielle.
+    # --------------------------------------------------------
+
+    bot_member = guild.me
+
+    if bot_member is None:
+
+        return (
+            False,
+            "Impossible d'identifier le rôle du Bot ISIB."
+        )
+
+    non_gerables = []
+
+    for role in (
+        roles_a_retirer
+        + roles_a_ajouter
+    ):
+
+        if (
+            role.managed
+            or role >= bot_member.top_role
+        ):
+
+            non_gerables.append(
+                role.name
+            )
+
+    if non_gerables:
+
+        return (
+            False,
+            (
+                "Le Bot ISIB ne peut pas gérer les rôles : "
+                + ", ".join(
+                    sorted(
+                        set(
+                            non_gerables
+                        )
+                    )
+                )
+                + ". Placez le rôle du bot au-dessus."
+            )
+        )
+
+    # --------------------------------------------------------
+    # On ajoute d'abord les nouveaux rôles.
+    # Si cet ajout échoue, aucun ancien rôle n'est retiré.
+    # --------------------------------------------------------
+
+    try:
+
+        if roles_a_ajouter:
+
+            await member.add_roles(
+                *roles_a_ajouter,
+                reason=(
+                    "Accès académiques validés par le CE ISIB"
+                )
+            )
+
+    except (
+        discord.Forbidden,
+        discord.HTTPException
+    ) as erreur:
+
+        return (
+            False,
+            f"Impossible d'ajouter les nouveaux rôles : {erreur}"
+        )
+
+    # --------------------------------------------------------
+    # Puis on retire les rôles académiques qui ne figurent
+    # plus dans la liste finale.
+    #
+    # Le rôle de vérification n'est pas dans noms_autorises :
+    # il ne peut donc jamais être retiré ici.
+    # --------------------------------------------------------
 
     try:
 
@@ -3011,39 +3862,40 @@ async def appliquer_profil_academique(
 
             await member.remove_roles(
                 *roles_a_retirer,
-
                 reason=(
-                    "Mise à jour de "
-                    "l'inscription académique"
+                    "Mise à jour des accès académiques "
+                    "validée par le CE ISIB"
                 )
             )
+
+    except (
+        discord.Forbidden,
+        discord.HTTPException
+    ) as erreur:
+
+        # ----------------------------------------------------
+        # Tentative de rollback des nouveaux rôles ajoutés.
+        # ----------------------------------------------------
 
         if roles_a_ajouter:
 
-            await member.add_roles(
-                *roles_a_ajouter,
+            try:
 
-                reason=(
-                    "Inscription académique validée"
+                await member.remove_roles(
+                    *roles_a_ajouter,
+                    reason=(
+                        "Rollback après échec de mise à jour "
+                        "des accès académiques"
+                    )
                 )
-            )
 
-    except discord.Forbidden:
+            except discord.HTTPException:
 
-        return (
-            False,
-            (
-                "Le bot n'a pas le droit de gérer "
-                "un ou plusieurs de ces rôles. "
-                "Vérifiez la hiérarchie des rôles."
-            )
-        )
-
-    except discord.HTTPException as erreur:
+                pass
 
         return (
             False,
-            f"Erreur Discord : {erreur}"
+            f"Impossible de retirer les anciens rôles : {erreur}"
         )
 
     return (
@@ -3053,52 +3905,27 @@ async def appliquer_profil_academique(
 
 
 # ============================================================
-# 7.3 VALIDATION
+# 7.3 VALIDATION ET NOTIFICATION
 # ============================================================
 
 async def notifier_validation_etudiant(
     member: discord.Member,
-    profile_key: str,
-    correction=False,
-    ancien_profile_key=None
+    roles_demandes: list[str],
+    roles_finaux: list[str],
+    correction=False
 ):
-
-    profil = PROFILS_ACADEMIQUES[
-        profile_key
-    ]
-
-    roles = "\n".join(
-        f"• {role}"
-        for role in profil["roles"]
-    )
 
     if correction:
 
-        ancien = description_profil(
-            ancien_profile_key
-        )
-
-        nouveau = description_profil(
-            profile_key
-        )
-
         texte = (
-            "✏️ **INSCRIPTION ACADÉMIQUE "
-            "CORRIGÉE ET VALIDÉE**\n\n"
+            "✏️ **DEMANDE ACADÉMIQUE MODIFIÉE ET VALIDÉE**\n\n"
 
-            "Vous aviez indiqué :\n"
-            f"**{ancien}**\n\n"
+            "Votre demande initiale était :\n"
+            f"{formater_roles(roles_demandes)}\n\n"
 
-            "Après vérification par les équipes "
-            "internes du Discord Étudiant ISIB, "
-            "votre profil a été corrigé en :\n"
-
-            f"**{nouveau}**\n\n"
-
-            "Vous disposez désormais "
-            "des accès académiques suivants :\n"
-
-            f"{roles}\n\n"
+            "Après vérification par le CE ISIB, "
+            "les accès finalement retenus sont :\n"
+            f"{formater_roles(roles_finaux)}\n\n"
 
             "Si vous pensez qu'il s'agit d'une erreur, "
             "contactez `isib-ce@he2b.be`."
@@ -3107,17 +3934,13 @@ async def notifier_validation_etudiant(
     else:
 
         texte = (
-            "✅ **INSCRIPTION ACADÉMIQUE VALIDÉE**\n\n"
+            "✅ **DEMANDE ACADÉMIQUE VALIDÉE**\n\n"
 
             "Votre demande a été validée.\n\n"
 
-            "Vous disposez désormais des accès "
-            "académiques suivants :\n"
+            "Vos accès académiques sont maintenant :\n"
+            f"{formater_roles(roles_finaux)}\n\n"
 
-            f"{roles}\n\n"
-
-            "Bienvenue dans la communauté étudiante "
-            "de l'ISIB - HE2B !"
         )
 
     try:
@@ -3128,15 +3951,18 @@ async def notifier_validation_etudiant(
 
         return True
 
-    except discord.Forbidden:
+    except (
+        discord.Forbidden,
+        discord.HTTPException
+    ):
 
         return False
 
 
-async def traiter_validation(
+async def traiter_validation_roles(
     interaction: discord.Interaction,
     request_id: int,
-    profile_key: str,
+    roles_finaux: list[str],
     correction=False
 ):
 
@@ -3171,6 +3997,19 @@ async def traiter_validation(
 
         return
 
+    roles_finaux = normaliser_roles_academiques(
+        roles_finaux
+    )
+
+    if not roles_finaux:
+
+        await interaction.followup.send(
+            "❌ Aucun rôle académique final sélectionné.",
+            ephemeral=True
+        )
+
+        return
+
     member = interaction.guild.get_member(
         demande["discord_user_id"]
     )
@@ -3193,9 +4032,9 @@ async def traiter_validation(
 
             return
 
-    succes, erreur = await appliquer_profil_academique(
+    succes, erreur = await appliquer_roles_academiques(
         member,
-        profile_key
+        roles_finaux
     )
 
     if not succes:
@@ -3218,7 +4057,7 @@ async def traiter_validation(
         request_id=request_id,
         statut=statut,
         reviewer_id=interaction.user.id,
-        final_profile_key=profile_key
+        final_roles=roles_finaux
     )
 
     await mettre_a_jour_message_validation(
@@ -3226,26 +4065,30 @@ async def traiter_validation(
         request_id
     )
 
-    dm_envoye = await notifier_validation_etudiant(
-        member=member,
-        profile_key=profile_key,
-        correction=correction,
-
-        ancien_profile_key=(
-            demande["requested_profile_key"]
+    roles_demandes = (
+        roles_demandes_depuis_demande(
+            demande
         )
     )
 
+    dm_envoye = await notifier_validation_etudiant(
+        member=member,
+        roles_demandes=roles_demandes,
+        roles_finaux=roles_finaux,
+        correction=correction
+    )
+
     texte_confirmation = (
-        "✅ **INSCRIPTION TRAITÉE**\n\n"
-        "Les rôles académiques ont été mis à jour."
+        "✅ **DEMANDE TRAITÉE**\n\n"
+        "Les rôles académiques ont été mis à jour "
+        "selon la liste finale."
     )
 
     if not dm_envoye:
 
         texte_confirmation += (
-            "\n\n⚠️ L'étudiant bloque ses messages privés. "
-            "Il peut consulter son résultat avec "
+            "\n\n⚠️ Impossible d'envoyer un DM "
+            "à l'étudiant. Il peut utiliser "
             "`/statut_inscription`."
         )
 
@@ -3256,7 +4099,7 @@ async def traiter_validation(
 
 
 # ============================================================
-# 7.3.1 BOUTONS DE VALIDATION
+# 7.4 BOUTONS VALIDER / MODIFIER / REFUSER
 # ============================================================
 
 class ValidationInscriptionView(
@@ -3278,17 +4121,15 @@ class ValidationInscriptionView(
             label="VALIDER",
             emoji="✅",
             style=discord.ButtonStyle.success,
-
             custom_id=(
                 f"academic_approve_{request_id}"
             )
         )
 
-        bouton_corriger = discord.ui.Button(
-            label="CORRIGER",
+        bouton_modifier = discord.ui.Button(
+            label="MODIFIER",
             emoji="✏️",
             style=discord.ButtonStyle.primary,
-
             custom_id=(
                 f"academic_correct_{request_id}"
             )
@@ -3298,7 +4139,6 @@ class ValidationInscriptionView(
             label="REFUSER",
             emoji="❌",
             style=discord.ButtonStyle.danger,
-
             custom_id=(
                 f"academic_refuse_{request_id}"
             )
@@ -3308,8 +4148,8 @@ class ValidationInscriptionView(
             self.valider
         )
 
-        bouton_corriger.callback = (
-            self.corriger
+        bouton_modifier.callback = (
+            self.modifier
         )
 
         bouton_refuser.callback = (
@@ -3321,7 +4161,7 @@ class ValidationInscriptionView(
         )
 
         self.add_item(
-            bouton_corriger
+            bouton_modifier
         )
 
         self.add_item(
@@ -3372,25 +4212,25 @@ class ValidationInscriptionView(
 
             return
 
+        roles_demandes = (
+            roles_demandes_depuis_demande(
+                demande
+            )
+        )
+
         await interaction.response.defer(
             ephemeral=True,
             thinking=True
         )
 
-        await traiter_validation(
+        await traiter_validation_roles(
             interaction=interaction,
             request_id=self.request_id,
-
-            profile_key=(
-                demande[
-                    "requested_profile_key"
-                ]
-            ),
-
+            roles_finaux=roles_demandes,
             correction=False
         )
 
-    async def corriger(
+    async def modifier(
         self,
         interaction: discord.Interaction
     ):
@@ -3422,12 +4262,43 @@ class ValidationInscriptionView(
 
             return
 
+        roles_demandes = (
+            roles_demandes_depuis_demande(
+                demande
+            )
+        )
+
+        roles_actuels = []
+
+        try:
+
+            roles_actuels = normaliser_roles_academiques(
+                json.loads(
+                    demande["current_roles_json"]
+                )
+            )
+
+        except (
+            json.JSONDecodeError,
+            TypeError
+        ):
+
+            roles_actuels = []
+
+        etat = EtatSelectionRoles(
+            roles_selectionnes=roles_demandes,
+            roles_actuels=roles_actuels
+        )
+
         await interaction.response.send_message(
-            "✏️ **CORRECTION DE LA DEMANDE**\n\n"
-            "Sélectionnez le profil académique "
-            "qui doit réellement être attribué.",
-            view=CorrectionProfilView(
-                self.request_id
+            texte_interface_selection(
+                etat,
+                "✏️ **MODIFICATION DE LA DEMANDE PAR LE CE ISIB**"
+            ),
+            view=SelectionRolesView(
+                etat=etat,
+                mode="ce",
+                request_id=self.request_id
             ),
             ephemeral=True
         )
@@ -3448,6 +4319,22 @@ class ValidationInscriptionView(
 
             return
 
+        demande = recuperer_demande(
+            self.request_id
+        )
+
+        if (
+            not demande
+            or demande["status"] != "pending"
+        ):
+
+            await interaction.response.send_message(
+                "⚠️ Cette demande a déjà été traitée.",
+                ephemeral=True
+            )
+
+            return
+
         await interaction.response.send_modal(
             RefusInscriptionModal(
                 self.request_id
@@ -3456,119 +4343,37 @@ class ValidationInscriptionView(
 
 
 # ============================================================
-# 7.4 CORRECTION
+# 7.5 MODIFICATION CE PAR BOUTONS COCHABLES
 # ============================================================
-
-class CorrectionProfilSelect(
-    discord.ui.Select
-):
-
-    def __init__(
-        self,
-        request_id: int
-    ):
-
-        self.request_id = request_id
-
-        options = []
-
-        for key in PROFILS_ACADEMIQUES:
-
-            options.append(
-                discord.SelectOption(
-                    label=(
-                        description_profil(
-                            key
-                        )[:100]
-                    ),
-
-                    value=key
-                )
-            )
-
-        super().__init__(
-            placeholder=(
-                "Sélectionnez le profil correct"
-            ),
-            min_values=1,
-            max_values=1,
-            options=options
-        )
-
-    async def callback(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        if not (
-            isinstance(
-                interaction.user,
-                discord.Member
-            )
-            and utilisateur_peut_valider_inscription(
-                interaction.user
-            )
-        ):
-
-            await interaction.response.send_message(
-                "❌ Permission insuffisante.",
-                ephemeral=True
-            )
-
-            return
-
-        profile_key = self.values[0]
-
-        await interaction.response.defer(
-            ephemeral=True,
-            thinking=True
-        )
-
-        await traiter_validation(
-            interaction=interaction,
-            request_id=self.request_id,
-            profile_key=profile_key,
-            correction=True
-        )
-
-
-class CorrectionProfilView(
-    discord.ui.View
-):
-
-    def __init__(
-        self,
-        request_id: int
-    ):
-
-        super().__init__(
-            timeout=300
-        )
-
-        self.add_item(
-            CorrectionProfilSelect(
-                request_id
-            )
-        )
+#
+# La même interface paginée que celle de l'étudiant est
+# réutilisée côté CE.
+#
+# Les rôles demandés sont pré-cochés en vert.
+# Le CE peut :
+# - en ajouter ;
+# - en retirer ;
+# - garder plusieurs années / orientations ;
+# puis cliquer sur VALIDER LA MODIFICATION.
+#
+# ============================================================
 
 
 # ============================================================
-# 7.5 REFUS
+# 7.6 REFUS
 # ============================================================
 
 class RefusInscriptionModal(
     discord.ui.Modal,
-    title="Refuser l'inscription"
+    title="Refuser la demande académique"
 ):
 
     motif = discord.ui.TextInput(
         label="Motif du refus",
-
         placeholder=(
             "Expliquez brièvement le motif "
             "si nécessaire."
         ),
-
         required=False,
         max_length=500,
         style=discord.TextStyle.paragraph
@@ -3636,6 +4441,7 @@ class RefusInscriptionModal(
             request_id=self.request_id,
             statut="refused",
             reviewer_id=interaction.user.id,
+            final_roles=None,
             refusal_reason=motif
         )
 
@@ -3657,6 +4463,21 @@ class RefusInscriptionModal(
                 demande["discord_user_id"]
             )
 
+        if (
+            member is None
+            and interaction.guild
+        ):
+
+            try:
+
+                member = await interaction.guild.fetch_member(
+                    demande["discord_user_id"]
+                )
+
+            except discord.HTTPException:
+
+                member = None
+
         dm_envoye = False
 
         if member:
@@ -3664,10 +4485,10 @@ class RefusInscriptionModal(
             try:
 
                 await member.send(
-                    "❌ **INSCRIPTION ACADÉMIQUE REFUSÉE**\n\n"
+                    "❌ **DEMANDE ACADÉMIQUE REFUSÉE**\n\n"
 
-                    "Votre demande d'inscription académique "
-                    "a été refusée.\n\n"
+                    "Votre demande d'accès académique "
+                    "n'a pas été validée.\n\n"
 
                     f"**Motif :** {motif}\n\n"
 
@@ -3680,7 +4501,10 @@ class RefusInscriptionModal(
 
                 dm_envoye = True
 
-            except discord.Forbidden:
+            except (
+                discord.Forbidden,
+                discord.HTTPException
+            ):
 
                 pass
 
@@ -3722,7 +4546,7 @@ class InscriptionAcademiqueView(
         )
 
     @discord.ui.button(
-        label="COMMENCER MON INSCRIPTION",
+        label="CHOISIR MES ACCÈS ACADÉMIQUES",
         emoji="✅",
         style=discord.ButtonStyle.success,
         custom_id="isib_academic_start"
@@ -3761,12 +4585,22 @@ class InscriptionAcademiqueView(
 
             return
 
-        # ----------------------------------------------------
-        # Seule une demande encore EN ATTENTE bloque.
-        #
-        # Une demande passée validée, corrigée ou refusée
-        # n'empêche jamais de recommencer.
-        # ----------------------------------------------------
+        identite = recuperer_etudiant_authentifie(
+            interaction.user.id
+        )
+
+        if not identite:
+
+            await interaction.response.send_message(
+                "⚠️ Votre rôle de vérification est présent, "
+                "mais votre identité n'existe pas dans "
+                "la base du bot.\n\n"
+                "Relancez une authentification dans "
+                "`#verification`.",
+                ephemeral=True
+            )
+
+            return
 
         demande_attente = (
             recuperer_demande_en_attente_etudiant(
@@ -3791,28 +4625,30 @@ class InscriptionAcademiqueView(
             )
         )
 
-        if roles_actuels:
+        # ----------------------------------------------------
+        # Les rôles actuels sont pré-cochés.
+        #
+        # L'étudiant peut donc :
+        # - les laisser cochés pour les conserver ;
+        # - les décocher pour demander leur retrait ;
+        # - cocher de nouveaux rôles ;
+        # - garder plusieurs années simultanément.
+        # ----------------------------------------------------
 
-            texte_roles = "\n".join(
-                f"• `{role}`"
-                for role in roles_actuels
-            )
-
-        else:
-
-            texte_roles = (
-                "• Aucun rôle académique actuellement attribué"
-            )
+        etat = EtatSelectionRoles(
+            roles_selectionnes=roles_actuels,
+            roles_actuels=roles_actuels
+        )
 
         await interaction.response.send_message(
-            "🎓 **INSCRIPTION ACADÉMIQUE**\n\n"
-
-            "**Votre situation académique actuelle :**\n"
-            f"{texte_roles}\n\n"
-
-            "Sélectionnez maintenant votre cursus :",
-
-            view=CursusView(),
+            texte_interface_selection(
+                etat,
+                "🎓 **SÉLECTION DE VOS RÔLES ACADÉMIQUES**"
+            ),
+            view=SelectionRolesView(
+                etat=etat,
+                mode="student"
+            ),
             ephemeral=True
         )
 
@@ -3827,26 +4663,28 @@ def creer_embed_inscription():
         title=TITRE_PANNEAU_INSCRIPTION,
 
         description=(
-            "Sélectionnez les choix correspondant "
-            "à votre situation académique :\n\n"
+            "Choisissez directement les rôles académiques "
+            "correspondant aux espaces auxquels vous devez "
+            "avoir accès :\n\n"
 
-            "1. Sélectionnez votre cursus\n"
-            "2. Sélectionnez votre niveau\n"
-            "3. Sélectionnez votre orientation "
-            "si nécessaire\n"
-            "4. Vérifiez puis envoyez votre demande\n"
-            "5. Votre demande sera contrôlée "
-            "par les équipes internes du Discord\n\n"
-
-            "Une nouvelle demande peut être introduite "
-            "ultérieurement si votre situation académique "
-            "évolue.\n\n"
+            "1. Ouvrez votre sélection académique\n"
+            "2. Vos rôles actuels sont déjà cochés en vert\n"
+            "3. Naviguez entre les pages BAPSIE, B1 ING, "
+            "B2 ING, B3 & BC ING, M1 ING et M2 ING\n"
+            "4. Cliquez directement sur les rôles pour "
+            "les cocher ou les décocher\n"
+            "5. Plusieurs niveaux peuvent être demandés "
+            "si vous avez des cours sur plusieurs années ; "
+            "la demande sera vérifiée par le CE ISIB\n"
+            "6. Envoyez votre demande\n"
+            "7. Vous recevrez une validation, une modification "
+            "ou un refus de votre demande\n\n"
 
             "🔵 CE ISIB | Conseil Étudiant ISIB\n"
             "📩 isib-ce@he2b.be\n"
             "💻 ISIBnet : Conseil Étudiant ISIB\n"
             "📸 Instagram : @cehe2b_isib\n"
-            "🌐 https://www.cehe2b.be"
+            "🌐 https://www.cehe2b.be/"
         )
     )
 
@@ -3949,6 +4787,16 @@ class ISIBBot(
         initialiser_base_de_donnees()
 
         # ----------------------------------------------------
+        # Nettoyage des demandes académiques orphelines.
+        #
+        # Une demande orpheline est une ancienne demande
+        # enregistrée comme "pending" mais qui n'a jamais
+        # réussi à produire de message dans le salon CE.
+        # ----------------------------------------------------
+
+        nettoyer_demandes_orphelines()
+
+        # ----------------------------------------------------
         # Boutons publics persistants.
         # ----------------------------------------------------
 
@@ -3962,7 +4810,7 @@ class ISIBBot(
 
         # ----------------------------------------------------
         # Réactivation automatique des boutons
-        # VALIDATION / CORRECTION / REFUS après redémarrage.
+        # VALIDATION / MODIFICATION / REFUS après redémarrage.
         # ----------------------------------------------------
 
         for demande in recuperer_demandes_en_attente():
@@ -4253,39 +5101,55 @@ async def statut_inscription(
 
     statut = demande["status"]
 
+    roles_demandes = (
+        roles_demandes_depuis_demande(
+            demande
+        )
+    )
+
     if statut == "pending":
 
         texte = (
             "⏳ **DEMANDE EN ATTENTE**\n\n"
             "Votre dernière demande est "
-            "en cours de validation."
+            "en cours de validation.\n\n"
+
+            "**Rôles demandés :**\n"
+            f"{formater_roles(roles_demandes)}"
         )
 
     elif statut == "approved":
 
-        profil = (
-            demande["final_profile_key"]
-            or demande["requested_profile_key"]
+        roles_finaux = (
+            roles_finaux_depuis_demande(
+                demande
+            )
         )
 
         texte = (
             "✅ **DERNIÈRE DEMANDE VALIDÉE**\n\n"
-            f"Profil : "
-            f"**{description_profil(profil)}**"
+
+            "**Rôles académiques validés :**\n"
+            f"{formater_roles(roles_finaux)}"
         )
 
     elif statut == "corrected":
 
-        profil = demande[
-            "final_profile_key"
-        ]
+        roles_finaux = (
+            roles_finaux_depuis_demande(
+                demande
+            )
+        )
 
         texte = (
             "✏️ **DERNIÈRE DEMANDE "
-            "CORRIGÉE ET VALIDÉE**\n\n"
+            "MODIFIÉE ET VALIDÉE**\n\n"
 
-            f"Profil finalement retenu : "
-            f"**{description_profil(profil)}**"
+            "**Votre demande initiale :**\n"
+            f"{formater_roles(roles_demandes)}\n\n"
+
+            "**Rôles finalement validés :**\n"
+            f"{formater_roles(roles_finaux)}"
         )
 
     elif statut == "refused":
@@ -4293,10 +5157,14 @@ async def statut_inscription(
         texte = (
             "❌ **DERNIÈRE DEMANDE REFUSÉE**\n\n"
 
-            f"Motif : "
+            "**Rôles demandés :**\n"
+            f"{formater_roles(roles_demandes)}\n\n"
+
+            f"**Motif :** "
             f"{demande['refusal_reason'] or 'Non précisé'}\n\n"
 
-            "Vos rôles précédents ont été conservés."
+            "Vos rôles académiques précédents "
+            "ont été conservés."
         )
 
     else:
