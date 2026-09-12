@@ -75,6 +75,7 @@ import secrets
 import asyncio
 import html
 import json
+import traceback
 
 from datetime import datetime, timezone
 
@@ -2529,6 +2530,17 @@ class RoleToggleButton(
 
             return
 
+        # ----------------------------------------------------
+        # On acquitte immédiatement l'interaction.
+        #
+        # C'est plus robuste sur un hébergement distant
+        # (Render, latence réseau, etc.) et évite que Discord
+        # affiche "Le bot n'a pas répondu à temps" pendant
+        # que le message est reconstruit.
+        # ----------------------------------------------------
+
+        await interaction.response.defer()
+
         if self.nom_role in self.etat.roles:
 
             self.etat.roles.discard(
@@ -2541,7 +2553,7 @@ class RoleToggleButton(
                 self.nom_role
             )
 
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=texte_interface_selection(
                 self.etat,
                 titre_mode_selection(
@@ -2615,7 +2627,9 @@ class PageRolesButton(
 
             return
 
-        await interaction.response.edit_message(
+        await interaction.response.defer()
+
+        await interaction.edit_original_response(
             content=texte_interface_selection(
                 self.etat,
                 titre_mode_selection(
@@ -2645,7 +2659,7 @@ class SelectionRolesView(
     ):
 
         super().__init__(
-            timeout=600
+            timeout=840
         )
 
         self.etat = etat
@@ -2820,6 +2834,54 @@ class SelectionRolesView(
                 bouton_annuler
             )
 
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item
+    ):
+
+        print()
+        print("❌ ERREUR INTERFACE INSCRIPTION ACADÉMIQUE")
+        print(f"Mode : {self.mode}")
+        print(f"Request ID : {self.request_id}")
+        print(f"Utilisateur : {interaction.user} ({interaction.user.id})")
+        print(f"Composant : {item}")
+        traceback.print_exception(
+            type(error),
+            error,
+            error.__traceback__
+        )
+        print()
+
+        message = (
+            "❌ **UNE ERREUR EST SURVENUE**\n\n"
+            "Le Bot ISIB n'a pas pu mettre à jour cette interface.\n"
+            "Fermez cette interface puis relancez **MODIFIER** "
+            "depuis la fiche de validation.\n\n"
+            "L'erreur technique a été enregistrée dans les logs du bot."
+        )
+
+        try:
+
+            if interaction.response.is_done():
+
+                await interaction.followup.send(
+                    message,
+                    ephemeral=True
+                )
+
+            else:
+
+                await interaction.response.send_message(
+                    message,
+                    ephemeral=True
+                )
+
+        except discord.HTTPException:
+
+            pass
+
     async def vider_page(
         self,
         interaction: discord.Interaction
@@ -2843,13 +2905,15 @@ class SelectionRolesView(
             self.page_index
         ]
 
+        await interaction.response.defer()
+
         for nom_role in groupe["roles"]:
 
             self.etat.roles.discard(
                 nom_role
             )
 
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=texte_interface_selection(
                 self.etat,
                 titre_mode_selection(
@@ -2884,6 +2948,8 @@ class SelectionRolesView(
 
             return
 
+        await interaction.response.defer()
+
         self.etat.roles = set(
             self.etat.roles_depart
         )
@@ -2892,7 +2958,7 @@ class SelectionRolesView(
             self.etat.roles
         )
 
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=texte_interface_selection(
                 self.etat,
                 titre_mode_selection(
