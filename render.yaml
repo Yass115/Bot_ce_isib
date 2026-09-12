@@ -1,0 +1,33 @@
+services:
+  - type: worker
+    name: bot-isib
+    runtime: python
+    plan: starter
+    region: frankfurt
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
+    disk:
+      name: bot-isib-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: DB_PATH
+        value: /var/data/bot_isib.db
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: EMAIL_SENDER
+        sync: false
+      - key: EMAIL_SENDER_NAME
+        sync: false
+      - key: AUDIT_CHANNEL_ID
+        sync: false
+      - key: VALIDATION_CHANNEL_ID
+        sync: false
