@@ -26,8 +26,6 @@ services:
         sync: false
       - key: VALIDATION_CHANNEL_ID
         sync: false
-      - key: ADMIN_CHANNEL_ID
-        sync: false
       - key: PGSSLMODE
         value: require
       - key: PGPORT

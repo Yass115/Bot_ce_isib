@@ -59,7 +59,6 @@
 #     10.3 /installer_verification
 #     10.4 /installer_inscription
 #     10.5 /statut_inscription
-#     10.6 /redemarrer_bot
 #
 # 11. DÉMARRAGE
 #
@@ -71,7 +70,6 @@
 # ============================================================
 
 import os
-import sys
 import time
 import secrets
 import asyncio
@@ -115,7 +113,6 @@ EMAIL_SENDER_NAME = os.getenv("EMAIL_SENDER_NAME")
 
 AUDIT_CHANNEL_ID = os.getenv("AUDIT_CHANNEL_ID")
 VALIDATION_CHANNEL_ID = os.getenv("VALIDATION_CHANNEL_ID")
-ADMIN_CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID")
 
 # --------------------------------------------------------------
 # Connexion PostgreSQL (Neon) en paramètres séparés plutôt
@@ -140,7 +137,6 @@ VARIABLES_OBLIGATOIRES = {
     "EMAIL_SENDER_NAME": EMAIL_SENDER_NAME,
     "AUDIT_CHANNEL_ID": AUDIT_CHANNEL_ID,
     "VALIDATION_CHANNEL_ID": VALIDATION_CHANNEL_ID,
-    "ADMIN_CHANNEL_ID": ADMIN_CHANNEL_ID,
     "PGHOST": PGHOST,
     "PGDATABASE": PGDATABASE,
     "PGUSER": PGUSER,
@@ -160,7 +156,6 @@ for nom_variable, valeur in VARIABLES_OBLIGATOIRES.items():
 GUILD_ID = int(GUILD_ID)
 AUDIT_CHANNEL_ID = int(AUDIT_CHANNEL_ID)
 VALIDATION_CHANNEL_ID = int(VALIDATION_CHANNEL_ID)
-ADMIN_CHANNEL_ID = int(ADMIN_CHANNEL_ID)
 
 
 # ============================================================
@@ -565,36 +560,6 @@ def recuperer_derniere_demande_etudiant(
     return resultat
 
 
-def recuperer_demande_en_attente_etudiant(
-    discord_user_id: int
-):
-
-    connexion = connexion_db()
-    curseur = connexion.cursor()
-
-    curseur.execute(
-        """
-        SELECT *
-        FROM academic_requests
-
-        WHERE discord_user_id = %s
-        AND status = 'pending'
-
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (
-            discord_user_id,
-        )
-    )
-
-    resultat = curseur.fetchone()
-
-    connexion.close()
-
-    return resultat
-
-
 def recuperer_demandes_en_attente():
 
     connexion = connexion_db()
@@ -834,6 +799,40 @@ async def recuperer_salon_validation(
         client,
         VALIDATION_CHANNEL_ID
     )
+
+
+async def epingler_panneau(
+    message: discord.Message
+) -> bool:
+    """
+    Épingle un panneau public sans empêcher son installation
+    si le bot ne possède pas la permission de gérer les messages.
+    """
+
+    if message.pinned:
+
+        return True
+
+    try:
+
+        await message.pin(
+            reason="Panneau permanent du Bot ISIB"
+        )
+
+        return True
+
+    except (
+        discord.Forbidden,
+        discord.HTTPException
+    ) as erreur:
+
+        print(
+            "⚠️ Impossible d'épingler automatiquement "
+            f"le panneau {message.id} :",
+            erreur
+        )
+
+        return False
 
 
 # ============================================================
@@ -1289,24 +1288,9 @@ class CodeVerificationModal(
             email
         )
 
-        if isinstance(
-            interaction.channel,
-            discord.TextChannel
-        ):
-
-            try:
-
-                await replacer_panneau_verification(
-                    interaction.channel
-                )
-
-            except discord.HTTPException as erreur:
-
-                print(
-                    "⚠️ Replacement du panneau "
-                    "de vérification impossible :",
-                    erreur
-                )
+        # Le panneau public reste fixe.
+        # Toute l'authentification de l'étudiant est éphémère :
+        # aucun nouveau panneau n'est renvoyé aux autres membres.
 
 
 class CodeVerificationView(
@@ -1360,7 +1344,7 @@ class VerificationModal(
 
     email = discord.ui.TextInput(
         label="Adresse mail HE2B",
-        placeholder="prenom.nom@etu.he2b.be",
+        placeholder="Ex. 55117@etu.he2b.be ou alias@etu.he2b.be",
         required=True,
         max_length=150
     )
@@ -1417,16 +1401,38 @@ class VerificationModal(
 
         # ----------------------------------------------------
         # Le domaine doit être exactement étudiant HE2B.
+        #
+        # La partie avant @ est libre : un matricule comme
+        # 55117@etu.he2b.be ou un alias comme
+        # cesakwa@etu.he2b.be sont tous les deux acceptés.
         # ----------------------------------------------------
 
-        if not email.endswith(
-            "@etu.he2b.be"
-        ):
+        adresse_valide = False
+
+        if email.count("@") == 1:
+
+            identifiant_mail, domaine_mail = email.split(
+                "@",
+                1
+            )
+
+            adresse_valide = bool(
+                identifiant_mail
+                and domaine_mail == "etu.he2b.be"
+                and not any(
+                    caractere.isspace()
+                    for caractere in identifiant_mail
+                )
+            )
+
+        if not adresse_valide:
 
             await interaction.response.send_message(
                 "❌ **ADRESSE MAIL NON VALIDE**\n\n"
-                "L'adresse doit se terminer par "
-                "`@etu.he2b.be`.",
+                "Utilisez une adresse étudiante se terminant "
+                "exactement par `@etu.he2b.be`.\n\n"
+                "Exemples : `55117@etu.he2b.be` ou "
+                "`alias@etu.he2b.be`.",
                 ephemeral=True
             )
 
@@ -1647,8 +1653,8 @@ def creer_embed_verification():
             "1. Commencez votre authentification\n"
             "2. Indiquez nom, prénom et adresse mail "
             "`@etu.he2b.be`\n"
-            "3. Un code temporaire sera envoyé par mail, "
-            "entrez ensuite le code reçu.\n"
+            "3. Un code temporaire sera envoyé par mail "
+            "(vérifiez vos spams), entrez ensuite le code reçu.\n"
             "4. Bienvenue dans la communauté étudiante "
             "de l'ISIB - HE2B !\n\n"
 
@@ -1674,10 +1680,16 @@ async def publier_panneau_verification(
     channel: discord.TextChannel
 ):
 
-    return await channel.send(
+    message = await channel.send(
         embed=creer_embed_verification(),
         view=VerificationView()
     )
+
+    await epingler_panneau(
+        message
+    )
+
+    return message
 
 
 async def replacer_panneau_verification(
@@ -1744,9 +1756,10 @@ async def replacer_panneau_verification(
 # 2. Ses rôles académiques actuels sont pré-cochés en vert.
 # 3. Il peut sélectionner PLUSIEURS rôles académiques via
 #    des boutons cochables répartis sur plusieurs pages.
-# 4. Il envoie une demande unique contenant la liste complète
-#    des rôles qu'il souhaite conserver / obtenir.
-# 5. Le CE ISIB peut :
+# 4. Chaque envoi crée une demande indépendante contenant la
+#    liste complète des rôles qu'il souhaite conserver / obtenir.
+#    Plusieurs demandes successives peuvent rester en attente.
+# 5. Le CE ISIB peut traiter chaque demande séparément :
 #       ✅ VALIDER
 #       ✏️ MODIFIER
 #       ❌ REFUSER
@@ -3165,7 +3178,7 @@ class RecapitulatifRolesView(
     ):
 
         super().__init__(
-            timeout=600
+            timeout=840
         )
 
         self.roles_demandes = (
@@ -3226,6 +3239,25 @@ class RecapitulatifRolesView(
                 etat=etat,
                 mode="student"
             )
+        )
+
+    @discord.ui.button(
+        label="ANNULER",
+        emoji="❌",
+        style=discord.ButtonStyle.secondary
+    )
+    async def annuler(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.edit_message(
+            content=(
+                "❌ **DEMANDE ANNULÉE AVANT ENVOI**\n\n"
+                "Aucune demande n'a été transmise au CE ISIB."
+            ),
+            view=None
         )
 
 
@@ -3293,27 +3325,12 @@ async def envoyer_demande_academique(
         return
 
     # --------------------------------------------------------
-    # Une seule demande EN ATTENTE à la fois.
+    # Les demandes successives sont autorisées.
+    #
+    # Chaque envoi crée une demande indépendante dans le salon
+    # interne du CE ISIB. Une demande précédente encore en
+    # attente ne bloque donc jamais l'étudiant.
     # --------------------------------------------------------
-
-    demande_attente = (
-        recuperer_demande_en_attente_etudiant(
-            interaction.user.id
-        )
-    )
-
-    if demande_attente:
-
-        await interaction.response.send_message(
-            "⏳ **DEMANDE DÉJÀ EN ATTENTE**\n\n"
-            "Votre précédente demande académique "
-            "n'a pas encore été traitée.\n\n"
-            "Attendez sa validation ou contactez "
-            "`isib-ce@he2b.be`.",
-            ephemeral=True
-        )
-
-        return
 
     roles_demandes = normaliser_roles_academiques(
         roles_demandes
@@ -3505,28 +3522,15 @@ async def envoyer_demande_academique(
         "Vos rôles ne changent pas tant que la "
         "demande n'est pas traitée.\n\n"
         "Vous recevrez un **message privé du Bot ISIB** "
-        "après validation, modification ou refus.",
+        "après validation, modification ou refus.\n\n"
+        "Vous pouvez introduire une autre demande si nécessaire ; "
+        "chaque demande sera examinée séparément.",
         ephemeral=True
     )
 
-    if isinstance(
-        interaction.channel,
-        discord.TextChannel
-    ):
-
-        try:
-
-            await replacer_panneau_inscription(
-                interaction.channel
-            )
-
-        except discord.HTTPException as erreur:
-
-            print(
-                "⚠️ Impossible de replacer "
-                "le panneau d'inscription :",
-                erreur
-            )
+    # Le panneau public reste fixe et épinglé.
+    # L'étudiant peut revenir au même panneau pour introduire
+    # une nouvelle demande, même si une précédente est en attente.
 
 
 # ============================================================
@@ -3564,6 +3568,12 @@ def construire_embed_validation(
     embed = discord.Embed(
         title=(
             "🎓 DEMANDE D'ACCÈS ACADÉMIQUES"
+        ),
+        description=(
+            "Chaque demande est indépendante. "
+            "Si un même étudiant en envoie plusieurs, "
+            "vérifiez leur ordre avant de valider afin que "
+            "la décision la plus récente reste bien la situation finale."
         ),
         timestamp=datetime.fromtimestamp(
             demande["created_at"],
@@ -4673,22 +4683,9 @@ class InscriptionAcademiqueView(
 
             return
 
-        demande_attente = (
-            recuperer_demande_en_attente_etudiant(
-                interaction.user.id
-            )
-        )
-
-        if demande_attente:
-
-            await interaction.response.send_message(
-                "⏳ **DEMANDE DÉJÀ EN ATTENTE**\n\n"
-                "Une de vos demandes est actuellement "
-                "en cours de validation.",
-                ephemeral=True
-            )
-
-            return
+        # Les demandes successives sont autorisées.
+        # Aucune demande en attente ne bloque l'ouverture
+        # d'une nouvelle sélection académique.
 
         roles_actuels = (
             lire_roles_academiques_membre(
@@ -4748,8 +4745,11 @@ def creer_embed_inscription():
             "si vous avez des cours sur plusieurs années ; "
             "la demande sera vérifiée par le CE ISIB\n"
             "6. Envoyez votre demande\n"
-            "7. Vous recevrez une validation, une modification "
-            "ou un refus de votre demande\n\n"
+            "7. Vous pouvez introduire une nouvelle demande "
+            "si votre situation évolue, même si une précédente "
+            "est encore en attente\n"
+            "8. Vous recevrez une validation, une modification "
+            "ou un refus pour chaque demande\n\n"
 
             "🔵 CE ISIB | Conseil Étudiant ISIB\n"
             "📩 isib-ce@he2b.be\n"
@@ -4773,10 +4773,16 @@ async def publier_panneau_inscription(
     channel: discord.TextChannel
 ):
 
-    return await channel.send(
+    message = await channel.send(
         embed=creer_embed_inscription(),
         view=InscriptionAcademiqueView()
     )
+
+    await epingler_panneau(
+        message
+    )
+
+    return message
 
 
 async def replacer_panneau_inscription(
@@ -5073,7 +5079,8 @@ async def installer_verification(
     )
 
     await interaction.followup.send(
-        "✅ Panneau d'authentification installé.",
+        "✅ Panneau d'authentification installé et épinglé "
+        "si le bot possède la permission nécessaire.",
         ephemeral=True
     )
 
@@ -5134,8 +5141,8 @@ async def installer_inscription(
     )
 
     await interaction.followup.send(
-        "✅ Panneau d'inscription "
-        "académique installé.",
+        "✅ Panneau d'inscription académique installé et "
+        "épinglé si le bot possède la permission nécessaire.",
         ephemeral=True
     )
 
@@ -5247,107 +5254,6 @@ async def statut_inscription(
     await interaction.response.send_message(
         texte,
         ephemeral=True
-    )
-
-
-# ============================================================
-# 10.6 /REDEMARRER_BOT
-# ============================================================
-#
-# Commande réservée à :
-# - ADMIN DISCORD
-# - COORDINATION CE ISIB
-#
-# Elle ne fonctionne que dans le salon défini par :
-# ADMIN_CHANNEL_ID
-#
-# Le processus Python courant est remplacé par une nouvelle
-# exécution du même bot.py. Cela fonctionne aussi bien en local
-# que sur un hébergement qui autorise le processus Python à se
-# relancer lui-même.
-# ============================================================
-
-@bot.tree.command(
-    name="redemarrer_bot",
-    description="Redémarre le Bot ISIB."
-)
-async def redemarrer_bot(
-    interaction: discord.Interaction
-):
-
-    # --------------------------------------------------------
-    # 1. Vérification du rôle
-    # --------------------------------------------------------
-
-    if not (
-        isinstance(
-            interaction.user,
-            discord.Member
-        )
-        and utilisateur_est_admin_bot(
-            interaction.user
-        )
-    ):
-
-        await interaction.response.send_message(
-            "❌ **PERMISSION INSUFFISANTE**\n\n"
-            "Cette commande est réservée à "
-            "`ADMIN DISCORD` et `COORDINATION CE ISIB`.",
-            ephemeral=True
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # 2. Vérification du salon
-    # --------------------------------------------------------
-
-    if interaction.channel_id != ADMIN_CHANNEL_ID:
-
-        await interaction.response.send_message(
-            "❌ **MAUVAIS SALON**\n\n"
-            "Cette commande doit être utilisée uniquement "
-            "dans `#administration-discord`.",
-            ephemeral=True
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # 3. Confirmation
-    # --------------------------------------------------------
-
-    await interaction.response.send_message(
-        "🔄 **REDÉMARRAGE DU BOT ISIB**\n\n"
-        f"Demandé par {interaction.user.mention}.\n\n"
-        "Le bot va se déconnecter quelques secondes "
-        "puis se reconnecter automatiquement.",
-        ephemeral=True
-    )
-
-    print()
-    print("----------------------------------------")
-    print("🔄 REDÉMARRAGE DU BOT DEMANDÉ")
-    print(
-        f"Par : {interaction.user} "
-        f"({interaction.user.id})"
-    )
-    print("----------------------------------------")
-    print()
-
-    # Laisse le temps à Discord d'afficher la confirmation.
-    await asyncio.sleep(2)
-
-    # --------------------------------------------------------
-    # 4. Redémarrage du processus Python
-    # --------------------------------------------------------
-
-    os.execv(
-        sys.executable,
-        [
-            sys.executable,
-            *sys.argv
-        ]
     )
 
 
